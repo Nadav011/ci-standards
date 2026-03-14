@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# GLOBAL PRE-COMMIT HOOK v2.0.0
+# Applies to ALL git repos on this machine automatically.
+# Detects: Node.js (npm/pnpm/bun), Flutter, Python, or generic.
+# Set via: git config --global core.hooksPath ~/.git-hooks
+
+set -uo pipefail
+
+# ── Move to repo root ────────────────────────────────────────────
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+cd "$REPO_ROOT"
+
+# ── Detect project type ──────────────────────────────────────────
+detect_pm() {
+  [ -f "pnpm-lock.yaml" ] && echo "pnpm" && return
+  [ -f "bun.lockb" ] || [ -f "bun.lock" ] && echo "bun" && return
+  echo "npm"
+}
+
+if [ -f "pubspec.yaml" ]; then
+  PROJECT_TYPE="flutter"
+elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ] || [ -f "setup.py" ]; then
+  PROJECT_TYPE="python"
+elif [ -f "package.json" ]; then
+  PROJECT_TYPE="node"
+  PM=$(detect_pm)
+else
+  PROJECT_TYPE="generic"
+fi
+
+# ── Get staged files ─────────────────────────────────────────────
+STAGED_ALL=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)
+[ -z "$STAGED_ALL" ] && exit 0
+
+STAGED_TS=$(echo "$STAGED_ALL" | grep -E '\.(ts|tsx)$' || true)
+STAGED_TS_SRC=$(echo "$STAGED_TS" | grep -v '\.test\.\|\.spec\.\|__tests__' || true)
+STAGED_PY=$(echo "$STAGED_ALL" | grep -E '\.py$' || true)
+STAGED_DART=$(echo "$STAGED_ALL" | grep -E '\.dart$' || true)
+
+ERRORS=0
+echo "🔍 pre-commit [$PROJECT_TYPE${PROJECT_TYPE:+/}${PM:-}] on $(git rev-parse --abbrev-ref HEAD)"
+
+# ══════════════════════════════════════════════════════
+# CHECK 1: Block direct commits to main/master
+# ══════════════════════════════════════════════════════
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]] && [ -z "${ALLOW_MAIN_COMMIT:-}" ]; then
+  echo "❌ [1] Commits to '$BRANCH' are blocked. Use a feature branch."
+  echo "   Override (emergency only): ALLOW_MAIN_COMMIT=1 git commit ..."
+  exit 1
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 2: lint-staged (Node — Biome/ESLint on staged files only)
+# ══════════════════════════════════════════════════════
+if [ "$PROJECT_TYPE" = "node" ] && [ -n "$STAGED_TS" ]; then
+  if python3 -c "import json; d=json.load(open('package.json')); exit(0 if 'lint-staged' in d else 1)" 2>/dev/null; then
+    echo "  [2] lint-staged..."
+    if ! npx lint-staged --concurrent false 2>&1; then
+      echo "❌ [2] lint-staged failed"
+      ERRORS=$((ERRORS + 1))
+    fi
+  fi
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 3: RTL violations (TS/TSX — Tailwind logical properties)
+# ══════════════════════════════════════════════════════
+if [ -n "$STAGED_TS" ]; then
+  RTL_OUT=""
+  for f in $STAGED_TS; do
+    [ -f "$f" ] || continue
+    V=$(grep -nE '\b(ml-[0-9a-z]|mr-[0-9a-z]|pl-[0-9a-z]|pr-[0-9a-z]|text-left|text-right|left-[0-9]|right-[0-9]|border-l-[^t]|border-r-|rounded-l-|rounded-r-|scroll-ml-|scroll-mr-)' \
+      "$f" 2>/dev/null | grep -v '// rtl-ok\|rtl:\|slide-in-from-\|slide-out-to-\|data-' || true)
+    [ -n "$V" ] && RTL_OUT="$RTL_OUT\n  $f:\n$V"
+  done
+  if [ -n "$RTL_OUT" ]; then
+    echo "❌ [3] RTL violations (Law #5) — use ms-/me-/ps-/pe-/inset-s-/inset-e-:"
+    printf "%b\n" "$RTL_OUT"
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 4: console.log in source (not tests, not edge functions)
+# ══════════════════════════════════════════════════════
+if [ -n "$STAGED_TS_SRC" ]; then
+  CL_OUT=""
+  for f in $STAGED_TS_SRC; do
+    [ -f "$f" ] || continue
+    # Allow in supabase/functions (Deno structured logging)
+    [[ "$f" == supabase/functions/* ]] && continue
+    V=$(grep -n 'console\.log' "$f" 2>/dev/null | grep -v '// DEBUG\|// console-ok' || true)
+    [ -n "$V" ] && CL_OUT="$CL_OUT\n  $f:\n$V"
+  done
+  if [ -n "$CL_OUT" ]; then
+    echo "❌ [4] console.log in source files:"
+    printf "%b\n" "$CL_OUT"
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 5: TypeScript `any` type
+# ══════════════════════════════════════════════════════
+if [ -n "$STAGED_TS_SRC" ]; then
+  ANY_OUT=$(git diff --cached -- $STAGED_TS_SRC 2>/dev/null \
+    | grep -E '^\+.*: any[ ;,)>]' | grep -v 'eslint-disable\|biome-ignore\|\.d\.ts' || true)
+  if [ -n "$ANY_OUT" ]; then
+    echo "❌ [5] \`any\` type detected — use \`unknown\` or specific type:"
+    echo "$ANY_OUT" | head -8
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 6: Secret scanning
+# ══════════════════════════════════════════════════════
+GITLEAKS_BIN=""
+command -v gitleaks >/dev/null 2>&1 && GITLEAKS_BIN="gitleaks"
+[ -z "$GITLEAKS_BIN" ] && [ -x "$HOME/.local/bin/gitleaks" ] && GITLEAKS_BIN="$HOME/.local/bin/gitleaks"
+
+if [ -n "$GITLEAKS_BIN" ]; then
+  if ! $GITLEAKS_BIN protect --staged --no-banner 2>&1; then
+    echo "❌ [6] Secret/credential detected by gitleaks!"
+    ERRORS=$((ERRORS + 1))
+  fi
+else
+  # Fallback pattern scan (supabase/functions excluded — they use Deno.env)
+  SEC=$(git diff --cached -- ':!supabase/functions/' 2>/dev/null \
+    | grep -E '^\+.*(sk_live_|sk_test_|PRIVATE KEY|-----BEGIN|eyJhbGciOiJ)' \
+    | grep -v '\.env\.example\|placeholder\|your_key' || true)
+  if [ -n "$SEC" ]; then
+    echo "❌ [6] Potential secret detected (install gitleaks for full scan):"
+    echo "$SEC" | head -3
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 7: Merge conflict markers
+# ══════════════════════════════════════════════════════
+CONFLICT=""
+for f in $STAGED_ALL; do
+  [ -f "$f" ] || continue
+  grep -qE '^(<{7}|={7}|>{7})' "$f" 2>/dev/null && CONFLICT="$CONFLICT $f"
+done
+if [ -n "$CONFLICT" ]; then
+  echo "❌ [7] Merge conflict markers in:$CONFLICT"
+  ERRORS=$((ERRORS + 1))
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 8: debugger statements
+# ══════════════════════════════════════════════════════
+if [ -n "$STAGED_TS" ]; then
+  DBG=""
+  for f in $STAGED_TS; do
+    [ -f "$f" ] || continue
+    V=$(grep -n '^\s*debugger\b' "$f" 2>/dev/null || true)
+    [ -n "$V" ] && DBG="$DBG\n  $f:\n$V"
+  done
+  if [ -n "$DBG" ]; then
+    echo "❌ [8] debugger statements:"
+    printf "%b\n" "$DBG"
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 9: Large files >500KB
+# ══════════════════════════════════════════════════════
+LARGE=""
+for f in $STAGED_ALL; do
+  case "$f" in *.lock|package-lock.json|pnpm-lock.yaml|yarn.lock) continue ;; esac
+  [ -f "$f" ] || continue
+  SZ=$(wc -c < "$f" 2>/dev/null || echo 0)
+  [ "$SZ" -gt 512000 ] && LARGE="$LARGE\n  $f ($(( SZ / 1024 ))KB)"
+done
+if [ -n "$LARGE" ]; then
+  echo "❌ [9] Large files staged (>500KB):"
+  printf "%b\n" "$LARGE"
+  ERRORS=$((ERRORS + 1))
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 10: .env file protection
+# ══════════════════════════════════════════════════════
+ENV_FILES=$(echo "$STAGED_ALL" | grep -E '(^|/)\.env($|\.)' | grep -v '\.example\|\.sample' || true)
+if [ -n "$ENV_FILES" ]; then
+  echo "❌ [10] .env file staged — never commit real credentials!"
+  echo "  $ENV_FILES"
+  ERRORS=$((ERRORS + 1))
+fi
+
+# ══════════════════════════════════════════════════════
+# CHECK 11: @ts-ignore without explanation
+# ══════════════════════════════════════════════════════
+if [ -n "$STAGED_TS" ]; then
+  TSI=""
+  for f in $STAGED_TS; do
+    [ -f "$f" ] || continue
+    V=$(grep -n '@ts-ignore$' "$f" 2>/dev/null || true)
+    [ -n "$V" ] && TSI="$TSI\n  $f:\n$V"
+  done
+  if [ -n "$TSI" ]; then
+    echo "❌ [11] Bare @ts-ignore — add: // @ts-ignore: <reason>"
+    printf "%b\n" "$TSI"
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+# ══════════════════════════════════════════════════════
+# Flutter-specific checks
+# ══════════════════════════════════════════════════════
+if [ "$PROJECT_TYPE" = "flutter" ] && [ -n "$STAGED_DART" ]; then
+  DART_RTL=""
+  for f in $STAGED_DART; do
+    [ -f "$f" ] || continue
+    V=$(grep -nE 'EdgeInsets\.only\((left|right):|TextAlign\.(left|right)\b|Alignment\.(center|top|bottom)(Left|Right)|Positioned\s*\(\s*(left|right):' \
+      "$f" 2>/dev/null || true)
+    [ -n "$V" ] && DART_RTL="$DART_RTL\n  $f:\n$V"
+  done
+  if [ -n "$DART_RTL" ]; then
+    echo "❌ [12] Flutter RTL violations — use EdgeInsetsDirectional/AlignmentDirectional:"
+    printf "%b\n" "$DART_RTL"
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+# ══════════════════════════════════════════════════════
+# Python-specific checks
+# ══════════════════════════════════════════════════════
+if [ "$PROJECT_TYPE" = "python" ] && [ -n "$STAGED_PY" ]; then
+  if command -v ruff >/dev/null 2>&1; then
+    if ! ruff check $STAGED_PY 2>&1; then
+      echo "❌ [13] Python ruff lint failed"
+      ERRORS=$((ERRORS + 1))
+    fi
+  elif command -v flake8 >/dev/null 2>&1; then
+    if ! flake8 $STAGED_PY 2>&1; then
+      echo "❌ [13] Python flake8 lint failed"
+      ERRORS=$((ERRORS + 1))
+    fi
+  fi
+fi
+
+# ── Final result ─────────────────────────────────────────────────
+echo ""
+if [ $ERRORS -gt 0 ]; then
+  echo "══════════════════════════════════════════════"
+  echo "❌ PRE-COMMIT FAILED ($ERRORS check(s) failed)"
+  echo "   Fix issues above, then: git commit"
+  echo "   Emergency bypass: git commit --no-verify"
+  echo "══════════════════════════════════════════════"
+  exit 1
+fi
+echo "══════════════════════════════════════════════"
+echo "✅ PRE-COMMIT PASSED — all checks OK"
+echo "══════════════════════════════════════════════"
+exit 0

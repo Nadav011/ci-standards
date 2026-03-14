@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# GLOBAL PRE-PUSH HOOK v2.0.0
+# Runs ONLY typecheck (+ Flutter analyze / Python mypy).
+# NO tests, NO build, NO lint — those run in CI.
+# Set via: git config --global core.hooksPath ~/.git-hooks
+
+set -uo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+cd "$REPO_ROOT"
+
+# ── Detect project type ──────────────────────────────────────────
+detect_pm() {
+  [ -f "pnpm-lock.yaml" ] && echo "pnpm" && return
+  [ -f "bun.lockb" ] || [ -f "bun.lock" ] && echo "bun" && return
+  echo "npm"
+}
+
+has_script() {
+  python3 -c "import json,sys; sys.exit(0 if '$1' in json.load(open('package.json')).get('scripts',{}) else 1)" 2>/dev/null
+}
+
+echo ""
+echo "⚡ pre-push: typecheck only (tests run in CI)"
+echo "────────────────────────────────────────────────"
+
+ERRORS=0
+
+# ── Node.js: typecheck only ──────────────────────────────────────
+if [ -f "package.json" ]; then
+  PM=$(detect_pm)
+  if has_script "typecheck"; then
+    echo "  TypeScript typecheck..."
+    if ! $PM run typecheck 2>&1; then
+      echo "❌ typecheck failed"
+      ERRORS=$((ERRORS + 1))
+    else
+      echo "✅ typecheck passed"
+    fi
+  fi
+fi
+
+# ── Flutter: analyze only ────────────────────────────────────────
+if [ -f "pubspec.yaml" ]; then
+  if command -v flutter >/dev/null 2>&1; then
+    echo "  Flutter analyze..."
+    if ! flutter analyze --fatal-infos 2>&1; then
+      echo "❌ flutter analyze failed"
+      ERRORS=$((ERRORS + 1))
+    else
+      echo "✅ flutter analyze passed"
+    fi
+  fi
+fi
+
+# ── Python: mypy (if configured) ─────────────────────────────────
+if [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+  if command -v mypy >/dev/null 2>&1 && [ -f "mypy.ini" -o -f "pyproject.toml" ]; then
+    echo "  Python mypy..."
+    if ! mypy . 2>&1; then
+      echo "❌ mypy failed"
+      ERRORS=$((ERRORS + 1))
+    else
+      echo "✅ mypy passed"
+    fi
+  fi
+fi
+
+# ── Result ───────────────────────────────────────────────────────
+echo "────────────────────────────────────────────────"
+if [ $ERRORS -gt 0 ]; then
+  echo "🚫 Push blocked — fix typecheck errors above"
+  echo "   Bypass: git push --no-verify"
+  exit 1
+fi
+echo "🚀 Pushing..."
+exit 0
