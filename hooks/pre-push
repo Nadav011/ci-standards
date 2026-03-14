@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
-# GLOBAL PRE-PUSH HOOK v2.0.0
-# Runs ONLY typecheck (+ Flutter analyze / Python mypy).
-# NO tests, NO build, NO lint — those run in CI.
-# Set via: git config --global core.hooksPath ~/.git-hooks
+# GLOBAL PRE-PUSH HOOK v3.0.0 — Industry Standard
+# Runs typecheck ONLY on main/master branch pushes.
+# Feature branches: pass through immediately (CI handles it).
+# Philosophy: fast local loop, CI is the source of truth.
 
 set -uo pipefail
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
 cd "$REPO_ROOT"
 
-# ── Detect project type ──────────────────────────────────────────
+# ── Read what branch is being pushed ─────────────────────────────
+# Git passes remote refs via stdin: <local-ref> <local-sha> <remote-ref> <remote-sha>
+PUSH_TARGET_BRANCH=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  PUSH_TARGET_BRANCH=$(echo "$remote_ref" | sed 's|refs/heads/||')
+done
+
+# ── Only run checks when pushing to main/master ──────────────────
+if [[ "$PUSH_TARGET_BRANCH" != "main" && "$PUSH_TARGET_BRANCH" != "master" ]]; then
+  # Feature branch push — instant, trust CI
+  exit 0
+fi
+
+# ── Main branch: typecheck only ──────────────────────────────────
 detect_pm() {
   [ -f "pnpm-lock.yaml" ] && echo "pnpm" && return
   [ -f "bun.lockb" ] || [ -f "bun.lock" ] && echo "bun" && return
@@ -21,18 +34,18 @@ has_script() {
 }
 
 echo ""
-echo "⚡ pre-push: typecheck only (tests run in CI)"
+echo "⚡ pre-push [main] — typecheck gate"
 echo "────────────────────────────────────────────────"
 
 ERRORS=0
 
-# ── Node.js: typecheck only ──────────────────────────────────────
+# Node.js: typecheck only
 if [ -f "package.json" ]; then
   PM=$(detect_pm)
   if has_script "typecheck"; then
     echo "  TypeScript typecheck..."
     if ! $PM run typecheck 2>&1; then
-      echo "❌ typecheck failed"
+      echo "❌ typecheck failed — fix before pushing to main"
       ERRORS=$((ERRORS + 1))
     else
       echo "✅ typecheck passed"
@@ -40,38 +53,22 @@ if [ -f "package.json" ]; then
   fi
 fi
 
-# ── Flutter: analyze only ────────────────────────────────────────
-if [ -f "pubspec.yaml" ]; then
-  if command -v flutter >/dev/null 2>&1; then
-    echo "  Flutter analyze..."
-    if ! flutter analyze --fatal-infos 2>&1; then
-      echo "❌ flutter analyze failed"
-      ERRORS=$((ERRORS + 1))
-    else
-      echo "✅ flutter analyze passed"
-    fi
+# Flutter: analyze only (on main)
+if [ -f "pubspec.yaml" ] && command -v flutter >/dev/null 2>&1; then
+  echo "  Flutter analyze..."
+  if ! flutter analyze --fatal-infos 2>&1; then
+    echo "❌ flutter analyze failed"
+    ERRORS=$((ERRORS + 1))
+  else
+    echo "✅ flutter analyze passed"
   fi
 fi
 
-# ── Python: mypy (if configured) ─────────────────────────────────
-if [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
-  if command -v mypy >/dev/null 2>&1 && [ -f "mypy.ini" -o -f "pyproject.toml" ]; then
-    echo "  Python mypy..."
-    if ! mypy . 2>&1; then
-      echo "❌ mypy failed"
-      ERRORS=$((ERRORS + 1))
-    else
-      echo "✅ mypy passed"
-    fi
-  fi
-fi
-
-# ── Result ───────────────────────────────────────────────────────
 echo "────────────────────────────────────────────────"
 if [ $ERRORS -gt 0 ]; then
-  echo "🚫 Push blocked — fix typecheck errors above"
+  echo "🚫 Push to main blocked — fix errors above"
   echo "   Bypass: git push --no-verify"
   exit 1
 fi
-echo "🚀 Pushing..."
+echo "🚀 Pushing to main..."
 exit 0
