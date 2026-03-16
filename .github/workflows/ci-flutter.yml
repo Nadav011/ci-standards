@@ -34,7 +34,7 @@ jobs:
       - run: dart format --set-exit-if-changed .
 
   test:
-    name: Flutter Test
+    name: Flutter Test (very_good)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -46,15 +46,53 @@ jobs:
           flutter-version: ${{ inputs.flutter-version }}
           cache: true
       - run: flutter pub get
-      - run: flutter test --coverage
+      # very_good_cli: fail-fast + coverage enforcement (replaces `flutter test`)
+      - run: dart pub global activate very_good_cli
+      - run: dart pub global run very_good_cli:very_good test --coverage --fail-fast
       - uses: actions/upload-artifact@v4
         with:
           name: flutter-coverage
           path: coverage/lcov.info
           retention-days: 7
 
+  # ── SECURITY LAYER ────────────────────────────────────────────────────────
+  # trivy: CVEs in Dart/pub deps + hardcoded secrets. CRITICAL = blocks merge.
+  trivy:
+    name: Trivy (CVE + Secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy — CRITICAL findings block merge
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+      - name: Trivy — HIGH findings (warning only)
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-results.sarif
+        continue-on-error: true
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+        continue-on-error: true
+
   gitleaks:
-    name: Secret Scan
+    name: Secret Scan (gitleaks)
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
@@ -63,17 +101,19 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # ─────────────────────────────────────────────────────────────────────────
 
   ci-gate:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [analyze, test, gitleaks]
+    needs: [analyze, test, trivy, gitleaks]
     steps:
       - run: |
           FAILED=0
-          [ "${{ needs.analyze.result }}"  != "success" ] && FAILED=1
-          [ "${{ needs.test.result }}"     != "success" ] && FAILED=1
-          [ "${{ needs.gitleaks.result }}" != "success" ] && FAILED=1
+          [ "${{ needs.analyze.result }}"  != "success" ] && FAILED=1 && echo "❌ analyze"
+          [ "${{ needs.test.result }}"     != "success" ] && FAILED=1 && echo "❌ test"
+          [ "${{ needs.trivy.result }}"    != "success" ] && FAILED=1 && echo "❌ trivy (CRITICAL CVE found)"
+          [ "${{ needs.gitleaks.result }}" != "success" ] && FAILED=1 && echo "❌ gitleaks (secret leaked)"
           [ $FAILED -eq 0 ] && echo "✅ Flutter CI passed" && exit 0
           echo "❌ Flutter CI failed" && exit 1
