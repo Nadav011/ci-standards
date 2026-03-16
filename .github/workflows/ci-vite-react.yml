@@ -9,6 +9,9 @@ on:
       node-version:
         type: string
         default: "24"
+      package-manager:
+        type: string
+        default: "pnpm"  # pnpm | npm
       test-shards:
         type: number
         default: 4
@@ -40,15 +43,24 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          cache: "npm"
-      - run: npm ci --legacy-peer-deps
+          cache: ${{ inputs.package-manager }}
+      - name: Install (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+      - name: Install (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci --legacy-peer-deps
       - uses: actions/cache/save@v4
         with:
           path: node_modules
-          key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
 
   typecheck:
     name: TypeCheck
@@ -57,18 +69,22 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
         with:
           path: node_modules
-          key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
       - uses: actions/cache@v4
         with:
           path: .tsbuildinfo
           key: tsbuildinfo-${{ runner.os }}-${{ hashFiles('tsconfig*.json', 'src/**/*.ts', 'src/**/*.tsx') }}
           restore-keys: tsbuildinfo-${{ runner.os }}-
-      - run: npm run typecheck
+      - run: ${{ inputs.package-manager }} run typecheck
 
   lint:
     name: Lint
@@ -77,13 +93,17 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
         with:
           path: node_modules
-          key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-      - run: npm run lint
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
+      - run: ${{ inputs.package-manager }} run lint
 
   # ── SECURITY LAYER ────────────────────────────────────────────────────────
   # trivy: CVEs in deps + hardcoded secrets. CRITICAL = blocks merge.
@@ -152,7 +172,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: false
 
-  # sbom: Software Bill of Materials + npm audit
+  # sbom: Software Bill of Materials + audit
   sbom:
     name: SBOM + Audit
     needs: install
@@ -160,13 +180,17 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
         with:
           path: node_modules
-          key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-      - run: npm audit --audit-level=critical
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
+      - run: ${{ inputs.package-manager == 'pnpm' && 'pnpm audit --audit-level=critical' || 'npm audit --audit-level=critical' }}
         continue-on-error: true
       - run: npx --yes @cyclonedx/cyclonedx-npm --output-file sbom.json --output-format JSON
         continue-on-error: true
@@ -189,12 +213,16 @@ jobs:
         shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
         with:
           path: node_modules
-          key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
       - run: npx vitest run --project unit --shard=${{ matrix.shard }}/${{ inputs.test-shards }}
 
   build:
@@ -204,12 +232,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
         with:
           path: node_modules
-          key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
       - name: Pull Vercel env (main only)
         if: github.ref == 'refs/heads/main'
         run: |
@@ -221,7 +253,7 @@ jobs:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         continue-on-error: true
-      - run: npm run build
+      - run: ${{ inputs.package-manager }} run build
         env: { NODE_ENV: production }
       - uses: actions/upload-artifact@v4
         with:
@@ -287,12 +319,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
         with:
           path: node_modules
-          key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
       - uses: actions/download-artifact@v4
         with: { name: build-dist, path: dist/ }
       - run: npx @lhci/cli@0.15.1 autorun
