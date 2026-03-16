@@ -94,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Trivy — CRITICAL findings block merge
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.30.0
         with:
           scan-type: fs
           scan-ref: .
@@ -103,7 +103,7 @@ jobs:
           ignore-unfixed: true
           format: table
       - name: Trivy — HIGH findings (warning only)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.30.0
         if: always()
         with:
           scan-type: fs
