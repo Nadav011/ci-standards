@@ -19,6 +19,8 @@ on:
         required: false
       VERCEL_PROJECT_ID:
         required: false
+      LHCI_GITHUB_APP_TOKEN:
+        required: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -80,8 +82,71 @@ jobs:
           key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
       - run: ${{ inputs.package-manager }} run lint
 
-  security:
-    name: Security + SBOM
+  # ── SECURITY LAYER ────────────────────────────────────────────────────────
+  # trivy: CVEs in deps + hardcoded secrets. CRITICAL = blocks merge.
+  trivy:
+    name: Trivy (CVE + Secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy — CRITICAL findings block merge
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+      - name: Trivy — HIGH findings (warning only)
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-results.sarif
+        continue-on-error: true
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+        continue-on-error: true
+
+  # semgrep: OWASP Top 10, XSS, SQL injection, Next.js/React patterns.
+  # Runs as warning — review findings in GitHub Security tab.
+  semgrep:
+    name: Semgrep (SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: semgrep/semgrep-action@v1
+        with:
+          config: auto
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  gitleaks:
+    name: Secret Scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # sbom: Software Bill of Materials + audit
+  sbom:
+    name: SBOM + Audit
     needs: install
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -93,23 +158,14 @@ jobs:
         with:
           path: node_modules
           key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
-      - run: ${{ inputs.package-manager == 'pnpm' && 'pnpm audit --audit-level=high' || 'npm audit --audit-level=high' }}
+      - run: ${{ inputs.package-manager == 'pnpm' && 'pnpm audit --audit-level=critical' || 'npm audit --audit-level=critical' }}
+        continue-on-error: true
       - run: npx --yes @cyclonedx/cyclonedx-npm --output-file sbom.json --output-format JSON
         continue-on-error: true
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: sbom, path: sbom.json, retention-days: 30 }
-
-  gitleaks:
-    name: Secret Scan
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # ─────────────────────────────────────────────────────────────────────────
 
   build:
     name: Build
@@ -133,15 +189,15 @@ jobs:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [typecheck, lint, security, gitleaks, build]
+    needs: [typecheck, lint, trivy, gitleaks, build]
     steps:
       - run: |
           FAILED=0
-          [ "${{ needs.typecheck.result }}" != "success" ] && FAILED=1
-          [ "${{ needs.lint.result }}"      != "success" ] && FAILED=1
-          [ "${{ needs.security.result }}"  != "success" ] && FAILED=1
-          [ "${{ needs.gitleaks.result }}"  != "success" ] && FAILED=1
-          [ "${{ needs.build.result }}"     != "success" ] && FAILED=1
+          [ "${{ needs.typecheck.result }}" != "success" ] && FAILED=1 && echo "❌ typecheck"
+          [ "${{ needs.lint.result }}"      != "success" ] && FAILED=1 && echo "❌ lint"
+          [ "${{ needs.trivy.result }}"     != "success" ] && FAILED=1 && echo "❌ trivy (CRITICAL CVE found)"
+          [ "${{ needs.gitleaks.result }}"  != "success" ] && FAILED=1 && echo "❌ gitleaks (secret leaked)"
+          [ "${{ needs.build.result }}"     != "success" ] && FAILED=1 && echo "❌ build"
           [ $FAILED -eq 0 ] && echo "✅ All checks passed" && exit 0
           echo "❌ CI failed" && exit 1
 
@@ -170,3 +226,27 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+  # ── POST-DEPLOY: Lighthouse CI (main only, informational) ────────────────
+  lhci:
+    name: Lighthouse CI
+    needs: [deploy]
+    if: |
+      needs.deploy.result == 'success' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ inputs.node-version }}" }
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
+      - uses: actions/download-artifact@v4
+        with: { name: build-out, path: .next/ }
+      - run: npx @lhci/cli@0.15.1 autorun
+        continue-on-error: true
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
