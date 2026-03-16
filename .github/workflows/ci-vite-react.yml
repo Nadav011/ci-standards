@@ -36,7 +36,7 @@ env:
 jobs:
   install:
     name: Install
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +53,7 @@ jobs:
   typecheck:
     name: TypeCheck
     needs: install
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +73,7 @@ jobs:
   lint:
     name: Lint
     needs: install
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +89,7 @@ jobs:
   # trivy: CVEs in deps + hardcoded secrets. CRITICAL = blocks merge.
   trivy:
     name: Trivy (CVE + Secrets)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +126,7 @@ jobs:
   # Tighten exit-code to "1" once existing findings are resolved.
   semgrep:
     name: Semgrep (SAST)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -139,7 +139,7 @@ jobs:
 
   gitleaks:
     name: Secret Scan (gitleaks)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 3
     permissions:
       contents: read
@@ -156,7 +156,7 @@ jobs:
   sbom:
     name: SBOM + Audit
     needs: install
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -181,7 +181,7 @@ jobs:
   unit-test:
     name: Tests (shard ${{ matrix.shard }}/${{ inputs.test-shards }})
     needs: install
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -200,7 +200,7 @@ jobs:
   build:
     name: Build
     needs: [typecheck, lint]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -231,7 +231,7 @@ jobs:
 
   ci-gate:
     name: CI Gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     if: always()
     needs: [typecheck, lint, unit-test, trivy, gitleaks, build]
     steps:
@@ -253,7 +253,7 @@ jobs:
       needs.ci-gate.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 10
     environment: production
     steps:
@@ -283,7 +283,7 @@ jobs:
     if: |
       needs.deploy.result == 'success' &&
       github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
