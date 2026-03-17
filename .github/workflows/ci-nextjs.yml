@@ -205,6 +205,14 @@ jobs:
           [ $FAILED -eq 0 ] && echo "✅ All checks passed" && exit 0
           echo "❌ CI failed" && exit 1
 
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          MSG="🚨 ci-standards/${{ github.event.repository.name }} CI FAILED | ${{ github.ref_name }} | ${{ github.actor }}"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" > /dev/null 2>&1 || true
   deploy:
     name: Deploy to Vercel
     needs: [ci-gate]
