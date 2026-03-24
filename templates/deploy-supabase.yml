@@ -1,0 +1,242 @@
+name: Deploy Supabase (Migrations + Edge Functions)
+# Zero-downtime Supabase deployment: migrations FIRST, then edge functions.
+# Runs AFTER CI gate passes, BEFORE Vercel app deploy.
+#
+# REQUIRED — fill in before copying:
+#   CI_WORKFLOW_NAME:    "CI"
+#   MAIN_BRANCH:         main
+#   SUPABASE_PROJECT_REF: from Supabase dashboard
+#
+# REQUIRED SECRETS:
+#   SUPABASE_ACCESS_TOKEN
+#   SUPABASE_DB_PASSWORD (for migration dry-run validation)
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+on:
+  workflow_run:
+    workflows: ["CI"]              # PLACEHOLDER: CI_WORKFLOW_NAME
+    types: [completed]
+    branches: [main, master]       # PLACEHOLDER: MAIN_BRANCH
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'supabase/migrations/**'
+      - 'supabase/functions/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SUPABASE_PROJECT_REF: "placeholder"  # PLACEHOLDER
+
+jobs:
+  # ── MIGRATION DRY-RUN (PR only — validate before merge) ──────────────────
+  migration-check:
+    name: Migration Dry Run
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.78.1
+
+      - name: Validate migrations (dry run)
+        run: |
+          supabase db push --dry-run \
+            --project-ref ${{ env.SUPABASE_PROJECT_REF }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Check for dangerous patterns
+        run: |
+          DANGEROUS=0
+          for f in supabase/migrations/*.sql; do
+            [ -f "$f" ] || continue
+            # USING(true) — allows all access
+            grep -inE "USING\s*\(\s*true\s*\)" "$f" && { echo "::error file=$f::USING(true) found — data leak risk"; DANGEROUS=1; }
+            # auth.uid() IS NULL bypass
+            grep -inE "auth\.uid\(\)\s*\)\s*IS\s*NULL" "$f" && { echo "::error file=$f::auth.uid() IS NULL bypass found"; DANGEROUS=1; }
+            # raw_user_meta_data for role — privilege escalation
+            grep -inE "raw_user_meta_data.*role" "$f" && { echo "::error file=$f::raw_user_meta_data role read — privilege escalation risk"; DANGEROUS=1; }
+            # DROP without IF EXISTS
+            grep -inE "DROP\s+(TABLE|INDEX|FUNCTION|TRIGGER|POLICY)" "$f" | grep -iv "IF EXISTS" && { echo "::warning file=$f::DROP without IF EXISTS"; }
+          done
+          [ $DANGEROUS -eq 1 ] && exit 1
+          echo "No dangerous patterns found"
+
+      - name: PR summary
+        if: always()
+        run: |
+          echo "## Supabase Migration Check" >> "$GITHUB_STEP_SUMMARY"
+          MIGRATION_COUNT=$(ls supabase/migrations/*.sql 2>/dev/null | wc -l)
+          FUNCTION_COUNT=$(ls -d supabase/functions/*/ 2>/dev/null | wc -l)
+          echo "| Metric | Count |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Migrations | $MIGRATION_COUNT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Edge Functions | $FUNCTION_COUNT |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── APPLY MIGRATIONS (main only — after CI passes) ────────────────────────
+  migrate:
+    name: Apply Migrations
+    if: |
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    environment:
+      name: production
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.78.1
+
+      - name: Check for pending migrations
+        id: check
+        run: |
+          OUTPUT=$(supabase db push --dry-run --project-ref ${{ env.SUPABASE_PROJECT_REF }} 2>&1)
+          if echo "$OUTPUT" | grep -q "No new migrations"; then
+            echo "has-migrations=false" >> $GITHUB_OUTPUT
+            echo "No pending migrations"
+          else
+            echo "has-migrations=true" >> $GITHUB_OUTPUT
+            echo "Pending migrations found:"
+            echo "$OUTPUT"
+          fi
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Apply migrations
+        if: steps.check.outputs.has-migrations == 'true'
+        run: |
+          supabase db push \
+            --project-ref ${{ env.SUPABASE_PROJECT_REF }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Notify Telegram on migration failure
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=🗄️ MIGRATION FAILED | ${{ github.repository }}%0AThis blocks the app deploy.%0ACommit: ${{ github.sha }}%0ARun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            > /dev/null 2>&1 || true
+
+  # ── DEPLOY EDGE FUNCTIONS (only changed ones) ─────────────────────────────
+  edge-functions:
+    name: Deploy Edge Functions
+    needs: migrate
+    if: |
+      always() &&
+      (needs.migrate.result == 'success' || needs.migrate.result == 'skipped') &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    environment:
+      name: production
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Need previous commit for diff
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.78.1
+
+      - name: Detect changed functions
+        id: changed
+        run: |
+          # Find functions changed in the last commit
+          CHANGED_FNS=$(git diff --name-only HEAD~1 HEAD -- 'supabase/functions/' 2>/dev/null | \
+            grep -oP 'supabase/functions/\K[^/]+' | sort -u | tr '\n' ' ')
+
+          if [ -z "$CHANGED_FNS" ]; then
+            echo "functions=" >> $GITHUB_OUTPUT
+            echo "No edge functions changed"
+          else
+            echo "functions=$CHANGED_FNS" >> $GITHUB_OUTPUT
+            echo "Changed functions: $CHANGED_FNS"
+          fi
+
+      - name: Deploy changed functions
+        if: steps.changed.outputs.functions != ''
+        run: |
+          DEPLOYED=0
+          FAILED=0
+          for fn in ${{ steps.changed.outputs.functions }}; do
+            echo "Deploying function: $fn"
+            if supabase functions deploy "$fn" --project-ref ${{ env.SUPABASE_PROJECT_REF }}; then
+              DEPLOYED=$((DEPLOYED + 1))
+              echo "Deployed: $fn"
+            else
+              FAILED=$((FAILED + 1))
+              echo "::error::Failed to deploy: $fn"
+            fi
+          done
+          echo "Deployed: $DEPLOYED, Failed: $FAILED"
+          [ $FAILED -gt 0 ] && exit 1
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Deploy ALL functions (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          supabase functions deploy \
+            --project-ref ${{ env.SUPABASE_PROJECT_REF }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          [ "$STATUS" = "success" ] && ICON="⚡" || ICON="🚨"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=${ICON} Edge Functions ${STATUS} | ${{ github.repository }}%0AFunctions: ${{ steps.changed.outputs.functions || 'all (manual)' }}%0ACommit: ${{ github.sha }}" \
+            > /dev/null 2>&1 || true
+
+  # ── BLOCKED (CI failed) ────────────────────────────────────────────────────
+  blocked:
+    name: Supabase Deploy Blocked
+    if: |
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion != 'success'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 2
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - run: |
+          echo "::error::Supabase deploy blocked — CI failed"
+          exit 1
+      - name: Notify Telegram
+        if: always()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=⛔ Supabase deploy BLOCKED — CI failed | ${{ github.repository }}" \
+            > /dev/null 2>&1 || true
