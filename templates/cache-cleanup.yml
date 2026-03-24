@@ -1,0 +1,52 @@
+name: Cache Cleanup
+
+on:
+  schedule:
+    - cron: '7 2 * * 0'  # Sunday 2:07 AM
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: cache-cleanup
+  cancel-in-progress: true
+
+jobs:
+  cleanup:
+    name: Clean Stale Caches
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - name: Clean old caches
+        run: |
+          echo "## Cache Cleanup Report" >> "$GITHUB_STEP_SUMMARY"
+
+          # Get all caches older than 7 days
+          CACHES=$(gh api repos/${{ github.repository }}/actions/caches \
+            --jq '.actions_caches[] | select(.created_at < (now - 604800 | todate)) | .id' \
+            2>/dev/null || echo "")
+
+          COUNT=0
+          for CACHE_ID in $CACHES; do
+            gh api --method DELETE \
+              repos/${{ github.repository }}/actions/caches/$CACHE_ID \
+              --silent 2>/dev/null && COUNT=$((COUNT + 1))
+          done
+
+          TOTAL=$(gh api repos/${{ github.repository }}/actions/caches \
+            --jq '.total_count' 2>/dev/null || echo "0")
+
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Caches deleted | $COUNT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Caches remaining | $TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Deleted $COUNT stale caches, $TOTAL remaining"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
