@@ -1,0 +1,68 @@
+name: Runner Health Check
+
+on:
+  schedule:
+    - cron: '7 */6 * * *'  # Every 6 hours at :07
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: health-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  health:
+    name: Runner Health
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - name: Check system health
+        id: health
+        run: |
+          FAILED=0
+          echo "## Runner Health Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Status | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+
+          # Disk space (fail if <10GB free)
+          DISK_FREE=$(df -BG / | awk 'NR==2{print $4}' | tr -d 'G')
+          [ "$DISK_FREE" -lt 10 ] && FAILED=1 && DISK_STATUS="FAIL" || DISK_STATUS="OK"
+          echo "| Disk Free | $DISK_STATUS | ${DISK_FREE}GB |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Memory (fail if <2GB free)
+          MEM_FREE=$(free -g | awk '/^Mem:/{print $7}')
+          [ "$MEM_FREE" -lt 2 ] && FAILED=1 && MEM_STATUS="FAIL" || MEM_STATUS="OK"
+          echo "| Memory Available | $MEM_STATUS | ${MEM_FREE}GB |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Node version
+          NODE_VER=$(node --version 2>/dev/null || echo "NOT FOUND")
+          echo "| Node.js | OK | $NODE_VER |" >> "$GITHUB_STEP_SUMMARY"
+
+          # pnpm version
+          PNPM_VER=$(pnpm --version 2>/dev/null || echo "NOT FOUND")
+          echo "| pnpm | OK | $PNPM_VER |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Runner uptime
+          UPTIME=$(uptime -p)
+          echo "| Uptime | OK | $UPTIME |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Orphan processes check
+          ORPHANS=$(ps aux | grep -E "node.*mcp|node.*apex|node.*context7" | grep -v grep | wc -l)
+          [ "$ORPHANS" -gt 5 ] && FAILED=1 && ORPHAN_STATUS="WARN ($ORPHANS)" || ORPHAN_STATUS="OK ($ORPHANS)"
+          echo "| Orphan MCP Processes | $ORPHAN_STATUS | $ORPHANS |" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram on failure
+        if: steps.health.outputs.failed == '1'
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=Runner Health DEGRADED | ${{ github.repository }}%0ACheck: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            > /dev/null 2>&1 || true
