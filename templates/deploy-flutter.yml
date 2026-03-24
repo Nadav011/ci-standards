@@ -1,0 +1,250 @@
+name: Deploy Flutter (Store + Shorebird)
+# Two-track Flutter CD: Store releases via Fastlane + OTA patches via Shorebird.
+# Trigger: manual (workflow_dispatch) with track selection.
+#
+# REQUIRED SECRETS:
+#   SHOREBIRD_TOKEN
+#   GOOGLE_PLAY_JSON_KEY (base64-encoded service account JSON)
+#   MATCH_PASSWORD (Fastlane Match for iOS)
+#   APP_STORE_CONNECT_API_KEY_ID, APP_STORE_CONNECT_API_ISSUER_ID, APP_STORE_CONNECT_API_KEY (iOS)
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#
+# REQUIRED VARS:
+#   CURRENT_RELEASE_VERSION (e.g., "1.2.3+45")
+
+on:
+  workflow_dispatch:
+    inputs:
+      track:
+        description: 'Deployment track'
+        required: true
+        type: choice
+        options:
+          - shorebird-patch      # Dart-only OTA hotfix
+          - android-internal     # Play Store internal testing
+          - android-beta         # Play Store open testing
+          - android-production   # Play Store production (staged 10%)
+          - ios-testflight       # TestFlight
+          - full-release         # Android + iOS + Shorebird baseline
+      rollout-percentage:
+        description: 'Android staged rollout % (production only)'
+        required: false
+        type: string
+        default: '10'
+
+concurrency:
+  group: flutter-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── VALIDATION ─────────────────────────────────────────────────────────────
+  validate:
+    name: Pre-Deploy Validation
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - name: Validate secrets
+        run: |
+          MISSING=0
+          [ -z "${{ secrets.SHOREBIRD_TOKEN }}" ] && echo "::error::SHOREBIRD_TOKEN missing" && MISSING=1
+          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && echo "::error::TELEGRAM_BOT_TOKEN missing" && MISSING=1
+          [ "${{ inputs.track }}" = "android-production" ] || [ "${{ inputs.track }}" = "android-beta" ] || [ "${{ inputs.track }}" = "android-internal" ] || [ "${{ inputs.track }}" = "full-release" ] && {
+            [ -z "${{ secrets.GOOGLE_PLAY_JSON_KEY }}" ] && echo "::error::GOOGLE_PLAY_JSON_KEY missing" && MISSING=1
+          }
+          [ $MISSING -eq 1 ] && exit 1
+          echo "All required secrets present"
+
+      - name: Validate branch
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Deploy only from main branch (current: ${{ github.ref }})"
+            exit 1
+          fi
+
+  # ── SHOREBIRD PATCH (Dart-only OTA) ────────────────────────────────────────
+  shorebird-patch:
+    name: Shorebird OTA Patch
+    needs: validate
+    if: contains(fromJSON('["shorebird-patch"]'), inputs.track)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - uses: shorebirdtech/setup-shorebird@v1
+        with:
+          cache: true
+
+      - name: Setup Flutter
+        run: echo "$HOME/.flutter-sdk/bin" >> $GITHUB_PATH
+
+      - run: flutter pub get
+
+      - name: Patch Android
+        run: |
+          shorebird patch android \
+            --release-version ${{ vars.CURRENT_RELEASE_VERSION }} \
+            --force
+        env:
+          SHOREBIRD_TOKEN: ${{ secrets.SHOREBIRD_TOKEN }}
+
+      - name: Patch iOS
+        run: |
+          shorebird patch ios \
+            --release-version ${{ vars.CURRENT_RELEASE_VERSION }} \
+            --force
+        env:
+          SHOREBIRD_TOKEN: ${{ secrets.SHOREBIRD_TOKEN }}
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          [ "$STATUS" = "success" ] && ICON="📲" || ICON="🚨"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=${ICON} Shorebird patch ${STATUS} | ${{ github.repository }}%0AVersion: ${{ vars.CURRENT_RELEASE_VERSION }}%0ABy: ${{ github.actor }}" \
+            > /dev/null 2>&1 || true
+
+  # ── ANDROID BUILD + DEPLOY ────────────────────────────────────────────────
+  android:
+    name: Android (${{ inputs.track }})
+    needs: validate
+    if: contains(fromJSON('["android-internal","android-beta","android-production","full-release"]'), inputs.track)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 30
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        run: echo "$HOME/.flutter-sdk/bin" >> $GITHUB_PATH
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - run: flutter pub get
+
+      - name: Build AAB
+        run: |
+          ROLLUP_NATIVE_THREADS=0 flutter build appbundle \
+            --release \
+            --obfuscate \
+            --split-debug-info=build/debug-info
+        env:
+          ROLLUP_NATIVE_THREADS: "0"
+
+      - name: Upload to Play Store
+        run: |
+          TRACK="${{ inputs.track }}"
+          case "$TRACK" in
+            android-internal) PLAY_TRACK="internal" ;;
+            android-beta) PLAY_TRACK="beta" ;;
+            android-production) PLAY_TRACK="production" ;;
+            full-release) PLAY_TRACK="internal" ;;
+          esac
+
+          EXTRA_ARGS=""
+          if [ "$PLAY_TRACK" = "production" ]; then
+            EXTRA_ARGS="--rollout ${{ inputs.rollout-percentage || '10' }}%"
+          fi
+
+          echo "Uploading to Play Store track: $PLAY_TRACK $EXTRA_ARGS"
+          echo "${{ secrets.GOOGLE_PLAY_JSON_KEY }}" | base64 -d > /tmp/play-key.json
+          bundle exec fastlane supply \
+            --aab build/app/outputs/bundle/release/app-release.aab \
+            --track "$PLAY_TRACK" \
+            --json_key /tmp/play-key.json \
+            $EXTRA_ARGS
+        env:
+          LC_ALL: en_US.UTF-8
+          LANG: en_US.UTF-8
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f /tmp/play-key.json
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-info-${{ github.sha }}
+          path: build/debug-info/
+          retention-days: 90
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          [ "$STATUS" = "success" ] && ICON="🤖" || ICON="🚨"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=${ICON} Android ${STATUS} | ${{ github.repository }}%0ATrack: ${{ inputs.track }}%0ABy: ${{ github.actor }}" \
+            > /dev/null 2>&1 || true
+
+  # ── iOS BUILD + DEPLOY (requires macOS) ────────────────────────────────────
+  ios:
+    name: iOS (${{ inputs.track }})
+    needs: validate
+    if: contains(fromJSON('["ios-testflight","full-release"]'), inputs.track)
+    runs-on: macos-15  # iOS builds MUST use macOS (Xcode requirement)
+    timeout-minutes: 45
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.x"
+          cache: true
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - run: flutter pub get
+
+      - name: Build and upload to TestFlight
+        run: bundle exec fastlane ios beta
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          security delete-keychain fastlane_tmp 2>/dev/null || true
+          rm -rf ~/Library/MobileDevice/Provisioning\ Profiles/* 2>/dev/null || true
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          [ "$STATUS" = "success" ] && ICON="🍎" || ICON="🚨"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=${ICON} iOS TestFlight ${STATUS} | ${{ github.repository }}%0ABy: ${{ github.actor }}" \
+            > /dev/null 2>&1 || true

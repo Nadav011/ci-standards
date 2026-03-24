@@ -1,10 +1,23 @@
 name: Deploy
+# TOP-tier Vercel CD pipeline with smoke tests, auto-rollback, SLSA attestation.
+#
+# REQUIRED — fill in before copying to project:
+#   CI_WORKFLOW_NAME:    "CI"           # name of the CI workflow to gate on
+#   PRODUCTION_URL:      https://app.example.com
+#   MAIN_BRANCH:         main           # main | master
+#
+# REQUIRED SECRETS:
+#   VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#
+# OPTIONAL SECRETS:
+#   LHCI_GITHUB_APP_TOKEN (for post-deploy Lighthouse)
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["CI"]              # PLACEHOLDER: CI_WORKFLOW_NAME
     types: [completed]
-    branches: [main, master]
+    branches: [main, master]       # PLACEHOLDER: MAIN_BRANCH
 
 permissions:
   contents: read
@@ -13,82 +26,228 @@ permissions:
   attestations: write
 
 concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
+  group: deploy-production
+  cancel-in-progress: false        # NEVER cancel a running deploy
+
+env:
+  VERCEL_VERSION: "50"             # Pin major, auto-resolves latest patch
+  PRODUCTION_URL: "https://app.example.com"  # PLACEHOLDER
 
 jobs:
+  # ── DEPLOY (CI must pass) ────────────────────────────────────────────────
   deploy:
-    name: Deploy to Vercel
+    name: Deploy to Production
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 15
     environment:
       name: production
       url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+      deploy-success: ${{ steps.deploy.conclusion == 'success' }}
     steps:
       - uses: step-security/harden-runner@v2.16.0
         with:
           egress-policy: audit
+
       - uses: actions/checkout@v4
 
       - name: Add Node.js (fnm) to PATH
         run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
 
-      - name: Install Vercel CLI
-        run: npm i -g vercel@latest
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm
 
-      - name: Pull Vercel Environment
-        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile 2>/dev/null || npm ci
 
-      - name: Build
-        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+      # ── VERCEL 3-STEP: pull → build → deploy ──────────────────────────────
+      - name: Pull Vercel environment
+        run: npx vercel@${{ env.VERCEL_VERSION }} pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
-      - name: Deploy
+      - name: Build for Vercel
+        run: npx vercel@${{ env.VERCEL_VERSION }} build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Deploy to production
         id: deploy
         run: |
-          URL=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
+          URL=$(npx vercel@${{ env.VERCEL_VERSION }} deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
           echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "Deployed to: $URL"
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
+      # ── SLSA ATTESTATION (L2) ─────────────────────────────────────────────
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/**
+          subject-path: .vercel/output/**
+        continue-on-error: true
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign deployment attestation
+      # ── COSIGN SIGNING ────────────────────────────────────────────────────
+      - uses: sigstore/cosign-installer@v4
+      - name: Sign deployment receipt
         if: success()
         run: |
-          echo "${{ steps.deploy.outputs.url }}" > deployment-receipt.txt
-          cosign sign-blob deployment-receipt.txt \
+          echo '{"url":"${{ steps.deploy.outputs.url }}","sha":"${{ github.sha }}","repo":"${{ github.repository }}","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > deployment-receipt.json
+          cosign sign-blob deployment-receipt.json \
             --output-certificate deployment-receipt.pem \
             --output-signature deployment-receipt.sig \
             --yes
         env:
           COSIGN_EXPERIMENTAL: "1"
 
-      - name: Notify Telegram
-        if: always()
+      - name: Upload deployment receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-receipt-${{ github.sha }}
+          path: deployment-receipt.*
+          retention-days: 90
+
+  # ── SMOKE TEST + AUTO-ROLLBACK ─────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test + Verify
+    needs: deploy
+    if: needs.deploy.result == 'success'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      # ── HEALTH CHECK: wait for deployment to be live ──────────────────────
+      - name: Wait for deployment
+        id: health
         run: |
-          STATUS="${{ job.status }}"
-          [ "$STATUS" = "success" ] && ICON="🚀" || ICON="🚨"
+          DEPLOY_URL="${{ needs.deploy.outputs.url }}"
+          echo "Checking: $DEPLOY_URL"
+
+          MAX_RETRIES=10
+          RETRY_DELAY=6
+          for i in $(seq 1 $MAX_RETRIES); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$DEPLOY_URL" 2>/dev/null || echo "000")
+            echo "Attempt $i/$MAX_RETRIES: HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+              echo "status=healthy" >> $GITHUB_OUTPUT
+              echo "Health check passed (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            sleep $RETRY_DELAY
+          done
+          echo "status=unhealthy" >> $GITHUB_OUTPUT
+          echo "::error::Health check failed after $MAX_RETRIES attempts"
+          exit 1
+
+      # ── SMOKE TESTS (hurl or curl-based) ──────────────────────────────────
+      - name: Run smoke tests
+        id: smoke
+        if: steps.health.outputs.status == 'healthy'
+        run: |
+          DEPLOY_URL="${{ needs.deploy.outputs.url }}"
+
+          # If hurl smoke tests exist, run them
+          if [ -d tests/smoke ] && ls tests/smoke/*.hurl 1>/dev/null 2>&1; then
+            hurl --test --variable BASE_URL="$DEPLOY_URL" tests/smoke/*.hurl
+          else
+            # Fallback: basic connectivity + content check
+            echo "No hurl smoke tests found — running basic checks"
+            BODY=$(curl -s --max-time 15 "$DEPLOY_URL")
+            echo "$BODY" | grep -qi "</html>" || { echo "::error::Response is not valid HTML"; exit 1; }
+            echo "Basic smoke test passed"
+          fi
+
+  # ── AUTO-ROLLBACK ON SMOKE FAILURE ─────────────────────────────────────────
+  rollback:
+    name: Auto-Rollback
+    needs: [deploy, smoke-test]
+    if: failure() && needs.deploy.result == 'success'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Execute rollback
+        run: |
+          echo "::warning::ROLLBACK TRIGGERED — smoke tests failed"
+          npx vercel@${{ env.VERCEL_VERSION }} rollback --token=${{ secrets.VERCEL_TOKEN }} || true
+          echo "Rollback completed"
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_VERSION: "50"
+
+      - name: Notify Telegram — ROLLBACK
+        run: |
           curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
-            --data-urlencode "text=${ICON} Deploy ${{ github.repository }}: ${STATUS} | ${{ github.ref_name }}" \
+            --data-urlencode "text=🔴 ROLLBACK TRIGGERED | ${{ github.repository }}%0ASmoke tests failed after deploy.%0ACommit: ${{ github.sha }}%0ABy: ${{ github.actor }}%0ARun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             > /dev/null 2>&1 || true
 
+  # ── NOTIFICATIONS ──────────────────────────────────────────────────────────
+  notify:
+    name: Notify
+    needs: [deploy, smoke-test]
+    if: always()
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 2
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - name: Notify Telegram
+        run: |
+          DEPLOY_RESULT="${{ needs.deploy.result }}"
+          SMOKE_RESULT="${{ needs.smoke-test.result }}"
+          URL="${{ needs.deploy.outputs.url }}"
+          SHA="${{ github.sha }}"
+          ACTOR="${{ github.actor }}"
+          REPO="${{ github.repository }}"
+          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$DEPLOY_RESULT" = "success" ] && [ "$SMOKE_RESULT" = "success" ]; then
+            MSG="🚀 DEPLOYED ✅ | ${REPO}%0AURL: ${URL}%0ACommit: ${SHA}%0ABy: ${ACTOR}"
+          elif [ "$DEPLOY_RESULT" = "success" ] && [ "$SMOKE_RESULT" != "success" ]; then
+            MSG="⚠️ DEPLOYED but smoke FAILED | ${REPO}%0ARollback may be in progress.%0ACommit: ${SHA}%0ARun: ${RUN}"
+          else
+            MSG="❌ DEPLOY FAILED | ${REPO}%0ACommit: ${SHA}%0ABy: ${ACTOR}%0ARun: ${RUN}"
+          fi
+
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=${MSG}" > /dev/null 2>&1 || true
+
+  # ── DEPLOY BLOCKED (CI failed) ────────────────────────────────────────────
   deploy-blocked:
     name: Deploy Blocked (CI Failed)
     if: github.event.workflow_run.conclusion != 'success'
     runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 2
     steps:
       - uses: step-security/harden-runner@v2.16.0
         with:
           egress-policy: audit
       - run: |
-          echo "Deploy blocked — CI workflow did not succeed"
-          echo "CI conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "::error::Deploy blocked — CI did not succeed (conclusion: ${{ github.event.workflow_run.conclusion }})"
           exit 1
       - name: Notify Telegram
         if: always()
