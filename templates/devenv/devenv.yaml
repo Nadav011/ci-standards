@@ -1,0 +1,80 @@
+# devenv.yaml — הגדרות בסיסיות לסביבת devenv
+#
+# קובץ זה חייב להיות בשורש הפרויקט לצד devenv.nix
+# מגדיר: מקורות nixpkgs, cachix, ו-devenv inputs
+#
+# PLACEHOLDER — התאם לפני שימוש:
+#   CACHIX_CACHE_NAME: my-cache     # שם ה-cache ב-cachix.org (אם מוגדר)
+#   PROJECT_NAME:      my-project   # שם הפרויקט
+#
+# דרישות קדם:
+#   1. devenv מותקן: curl -L https://devenv.sh/install.sh | bash
+#   2. direnv מותקן (אופציונלי אבל מומלץ): apt install direnv
+#
+# שימוש:
+#   devenv shell      — כניסה ל-shell עם כל ה-dependencies
+#   devenv up         — הפעלת כל התהליכים (dev + test-watch וכו')
+#   devenv test       — הרצת pre-commit hooks + בדיקות
+#   devenv build      — בנייה
+#   devenv gc         — ניקוי packages שלא בשימוש (חוסך מקום)
+
+# ─── nixpkgs ─────────────────────────────────────────────────────────────────
+#
+# nixos-unstable מכיל תמיד את הגרסאות העדכניות ביותר.
+# לייצוב — הצמד ל-revision ספציפי (rev):
+#
+#   rev: <git sha of nixpkgs>
+#
+# לבדיקת revision עדכני: https://status.nixos.org/
+# לבדיקת גרסה של package ספציפי: https://search.nixos.org/packages
+
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-unstable
+
+  # devenv עצמו כ-input — מבטיח שאנו עובדים עם גרסה ספציפית
+  devenv:
+    url: github:cachix/devenv
+
+# ─── Cachix ──────────────────────────────────────────────────────────────────
+#
+# Cachix מאחסן binary cache של Nix — מאיץ משמעותית את `devenv shell`
+# ללא cachix: הרצה ראשונה מהדרת הכל (20-30 דקות).
+# עם cachix: הרצה ראשונה ~2-5 דקות, הרצות הבאות <30 שניות.
+#
+# הגדרה:
+#   1. צור חשבון: https://www.cachix.org/
+#   2. `cachix authtoken <your-token>`
+#   3. החלף CACHIX_CACHE_NAME בשם ה-cache שלך
+#
+# Cache ציבורי של devenv כבר מוגדר (devenv.cachix.org) — מכיל packages נפוצים
+
+caches:
+  # Cache ציבורי של devenv — חובה
+  - devenv.cachix.org
+
+  # PLACEHOLDER: הוסף את ה-cache הפרטי שלך (אם יש)
+  # - CACHIX_CACHE_NAME.cachix.org
+
+# ─── דוגמת שימוש עם GitHub Actions ──────────────────────────────────────────
+#
+# CI עם devenv ו-cachix:
+#
+# jobs:
+#   dev-env:
+#     runs-on: [self-hosted, linux, x64, pop-os]
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: cachix/install-nix-action@v30
+#         with:
+#           nix_path: nixpkgs=channel:nixos-unstable
+#       - uses: cachix/cachix-action@v15
+#         with:
+#           name: CACHIX_CACHE_NAME
+#           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+#       - run: devenv shell -- pnpm run typecheck
+#       - run: devenv shell -- pnpm run lint
+#       - run: devenv shell -- pnpm run test
+#
+# הערה: CI בפועל משתמש ב-ci-standards workflows (ci-vite-react.yml וכו')
+# devenv ב-CI מיועד לבדיקות נוספות ולא מחליף את ה-CI הקיים.
