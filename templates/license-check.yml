@@ -1,0 +1,54 @@
+name: License Check
+
+on:
+  pull_request:
+    paths: ["package.json", "pnpm-lock.yaml", "package-lock.json"]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: license-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  license-check:
+    name: License Compliance
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile 2>/dev/null || npm ci
+
+      - name: Check licenses
+        run: |
+          npx license-checker-rseidelsohn@4.4.2 --production --failOn "GPL-3.0;AGPL-3.0;AGPL-3.0-only;GPL-3.0-only;SSPL-1.0;EUPL-1.1" --summary
+          echo "No GPL/AGPL/SSPL dependencies found"
+
+      - name: License summary
+        if: always()
+        run: |
+          echo "## License Summary" >> "$GITHUB_STEP_SUMMARY"
+          npx license-checker-rseidelsohn@4.4.2 --production --summary --csv | head -20 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=📜 License Check FAILED | ${{ github.repository }} | ${{ github.ref_name }}" \
+            > /dev/null 2>&1 || true

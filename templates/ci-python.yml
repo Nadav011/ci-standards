@@ -1,0 +1,154 @@
+name: Python CI
+# Template for Python projects.
+# Projects using this: chance-pro, ai-agent-system
+#
+# REQUIRED — fill in before copying to project:
+#   PROJECT_NAME: my-project  # used in Telegram messages
+#   MAIN_BRANCH:  main        # main | master
+#   TEST_CMD:     pytest --cov --cov-report=term-missing --cov-fail-under=60 -v
+#
+# OPTIONAL: pyproject.toml is preferred over requirements.txt.
+# Add to pyproject.toml:
+#   [tool.ruff]
+#   target-version = "py310"
+#   line-length = 120
+#   [tool.mypy]
+#   python_version = "3.12"
+#   strict = true
+#   ignore_missing_imports = true
+#   [tool.pytest.ini_options]
+#   testpaths = ["tests"]
+
+on:
+  push:
+    branches: [main, master]        # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    branches: [main, master]        # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (Ruff)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv + ruff
+        run: pip install uv && uv pip install --system ruff
+      - name: Ruff check
+        run: ruff check . --output-format=github
+      - name: Ruff format check
+        run: ruff format --check .
+
+  typecheck:
+    name: Type Check (mypy)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install deps
+        run: |
+          pip install uv
+          uv pip install --system -r requirements.txt 2>/dev/null || true
+      - name: Install mypy
+        run: uv pip install --system mypy
+      - name: mypy
+        run: mypy . --strict --ignore-missing-imports
+
+  test:
+    name: Tests (Pytest)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install deps
+        run: |
+          pip install uv
+          uv pip install --system -r requirements.txt 2>/dev/null || uv pip install --system pytest pytest-cov hypothesis
+      - name: Run tests
+        run: pytest --cov --cov-report=term-missing --cov-fail-under=60 -v
+
+  security:
+    name: Security Scan
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Gitleaks
+        run: gitleaks detect --source . --verbose --exit-code 1
+      - name: Bandit (Python SAST)
+        run: pip install uv && uv pip install --system bandit && bandit -r . -ll -ii --exclude ./tests,./venv,./.venv
+        continue-on-error: true
+      - name: Trivy
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          severity: CRITICAL
+          exit-code: "1"
+      - name: pip-audit
+        run: pip install uv && uv pip install --system pip-audit && pip-audit --strict --desc
+        continue-on-error: true
+
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs: [lint, typecheck, test, security]
+    runs-on: [self-hosted, linux, x64, pop-os]
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - run: |
+          FAILED=0
+          [ "${{ needs.lint.result }}" != "success" ] && FAILED=1 && echo "lint failed"
+          [ "${{ needs.typecheck.result }}" != "success" ] && FAILED=1 && echo "typecheck failed"
+          [ "${{ needs.test.result }}" != "success" ] && FAILED=1 && echo "test failed"
+          [ "${{ needs.security.result }}" != "success" ] && FAILED=1 && echo "security failed"
+          [ $FAILED -eq 0 ] && echo "CI passed" && exit 0
+          echo "CI failed" && exit 1
+      - name: Notify Telegram
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=🚨 Python CI FAILED | ${{ github.repository }} | ${{ github.ref_name }}" \
+            > /dev/null 2>&1 || true

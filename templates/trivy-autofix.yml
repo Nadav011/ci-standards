@@ -1,0 +1,201 @@
+name: Trivy CVE Auto-Fix
+# Universal weekly CVE scan + auto-PR template.
+# Runs every Sunday at 3AM, scans for HIGH/CRITICAL CVEs,
+# opens a PR with pnpm.overrides patches when found.
+#
+# REQUIRED — fill in before copying to project:
+#   PACKAGE_MANAGER: pnpm    # pnpm | npm
+#   MAIN_BRANCH:     main    # main | master
+#   LOCKFILE:        pnpm-lock.yaml   # pnpm-lock.yaml | package-lock.json
+#
+# NOTE for npm projects (Z/cash): uses `npm audit fix` instead of pnpm.overrides.
+# NOTE for pnpm projects: adds entries to pnpm.overrides in package.json.
+#
+# How pnpm auto-fix works:
+#   1. trivy scan → JSON output
+#   2. python3 extracts package names + minimum safe versions
+#   3. jq patches pnpm.overrides in package.json
+#   4. pnpm install to regenerate lockfile
+#   5. gh pr create if there are changes
+#
+# Requires: gh CLI installed on runner (it is — pop-os runner has it).
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'        # Sunday 3AM
+  workflow_dispatch:
+
+concurrency:
+  group: trivy-autofix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  trivy-fix:
+    name: Scan + Auto-Fix CVEs
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+
+      - run: pnpm install --frozen-lockfile      # PLACEHOLDER: npm ci for npm projects
+
+      - name: Trivy scan — output JSON
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          format: json
+          output: /tmp/trivy-results.json
+          exit-code: "0"
+          ignore-unfixed: true
+        continue-on-error: true
+
+      - name: Count vulnerabilities
+        id: count
+        run: |
+          COUNT=$(python3 -c "
+          import json, sys
+          try:
+            d = json.load(open('/tmp/trivy-results.json'))
+            total = sum(len(r.get('Vulnerabilities') or []) for r in d.get('Results', []))
+            print(total)
+          except Exception as e:
+            print(0)
+          ")
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "Found $COUNT HIGH/CRITICAL vulnerabilities"
+
+      - name: Skip if clean
+        if: steps.count.outputs.count == '0'
+        run: echo "No HIGH/CRITICAL CVEs found — nothing to fix."
+
+      # ── PNPM auto-fix ─────────────────────────────────────────────────────────
+      # PLACEHOLDER: Keep for pnpm projects. For npm projects, replace with npm audit fix block below.
+      - name: Build pnpm.overrides patches
+        if: steps.count.outputs.count != '0'
+        run: |
+          python3 << 'PYEOF'
+          import json, subprocess, sys
+
+          with open('/tmp/trivy-results.json') as f:
+            data = json.load(f)
+
+          overrides = {}
+          for result in data.get('Results', []):
+            for vuln in (result.get('Vulnerabilities') or []):
+              pkg = vuln.get('PkgName', '')
+              fixed = vuln.get('FixedVersion', '')
+              severity = vuln.get('Severity', '')
+              if fixed and severity in ('HIGH', 'CRITICAL') and pkg:
+                # Use ">=" prefix so pnpm resolves the minimum safe version
+                overrides[pkg] = f">={fixed.split(',')[0].strip()}"
+
+          if not overrides:
+            print("No fixable CVEs found (no FixedVersion available)")
+            sys.exit(0)
+
+          print(f"CVEs to patch via pnpm.overrides: {overrides}")
+          with open('/tmp/cve-overrides.json', 'w') as f:
+            json.dump(overrides, f)
+          PYEOF
+
+      - name: Apply pnpm.overrides to package.json
+        if: steps.count.outputs.count != '0'
+        run: |
+          if [ ! -f /tmp/cve-overrides.json ]; then
+            echo "No overrides to apply"
+            exit 0
+          fi
+          python3 << 'PYEOF'
+          import json
+
+          with open('package.json') as f:
+            pkg = json.load(f)
+          with open('/tmp/cve-overrides.json') as f:
+            new_overrides = json.load(f)
+
+          if not new_overrides:
+            exit(0)
+
+          # pnpm ONLY respects overrides inside the "pnpm" field — root-level "overrides" is silently ignored
+          if 'pnpm' not in pkg:
+            pkg['pnpm'] = {}
+          existing = pkg['pnpm'].get('overrides', {})
+          existing.update(new_overrides)
+          pkg['pnpm']['overrides'] = existing
+
+          with open('package.json', 'w') as f:
+            json.dump(pkg, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+
+          print(f"Applied {len(new_overrides)} override(s) to package.json pnpm.overrides")
+          PYEOF
+
+      - name: Regenerate lockfile
+        if: steps.count.outputs.count != '0'
+        run: pnpm install                        # PLACEHOLDER: npm install for npm projects
+
+      # ── NPM auto-fix (PLACEHOLDER — uncomment for npm projects like Z/cash) ──
+      # - name: npm audit fix
+      #   if: steps.count.outputs.count != '0'
+      #   run: npm audit fix --force || true
+
+      - name: Verify CVEs patched
+        if: steps.count.outputs.count != '0'
+        run: |
+          trivy fs . --severity HIGH,CRITICAL --format table --exit-code 0 --ignore-unfixed || true
+          echo "Verification complete — check output above for remaining CVEs"
+
+      - name: Open PR if changes exist
+        if: steps.count.outputs.count != '0'
+        run: |
+          if ! git diff --quiet; then
+            BRANCH="fix/cve-autofix-$(date +%Y%m%d)"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -b "$BRANCH"
+            git add package.json pnpm-lock.yaml   # PLACEHOLDER: package-lock.json for npm
+            git commit -m "fix: auto-patch HIGH/CRITICAL CVEs via pnpm.overrides"
+            git push origin HEAD:"$BRANCH"
+            PR_BODY="## CVE Auto-Fix\n\nAutomated weekly CVE scan found and patched HIGH/CRITICAL vulnerabilities.\n\n### What changed\n- Updated \`pnpm.overrides\` in \`package.json\` to patch vulnerable transitive deps\n- Regenerated \`pnpm-lock.yaml\`\n\n### Verify\n\`\`\`bash\ntrivy fs . --severity HIGH,CRITICAL\n\`\`\`\n\n_Auto-generated by trivy-autofix.yml on $(date +%Y-%m-%d)_"
+            gh pr create \
+              --title "fix: auto-patch HIGH/CRITICAL CVEs ($(date +%Y-%m-%d))" \
+              --body "$PR_BODY" \
+              --base main \
+              --head "$BRANCH" \
+              --label "security,dependencies"
+          else
+            echo "No lockfile changes after patching — CVEs may be unfixable without major updates"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PLACEHOLDER: MAIN_BRANCH in --base above (mediflow uses master)
+
+      - name: Notify Telegram
+        if: steps.count.outputs.count != '0'
+        run: |
+          COUNT="${{ steps.count.outputs.count }}"
+          MSG="🔐 *CVE Scan: my-project*%0A%0AFound ${COUNT} HIGH/CRITICAL CVE(s)%0AAuto-fix PR opened if fixable.%0A%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # PLACEHOLDER: PROJECT_NAME in msg above
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true

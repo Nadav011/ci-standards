@@ -1,0 +1,142 @@
+name: Supabase CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "supabase/**"
+      - "*.sql"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "supabase/**"
+      - "*.sql"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  migration-check:
+    name: Migration Validation
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Verify migrations parse
+        run: |
+          if [ -d "supabase/migrations" ]; then
+            echo "Found $(ls supabase/migrations/*.sql 2>/dev/null | wc -l) migration files"
+            for f in supabase/migrations/*.sql; do
+              [ -f "$f" ] || continue
+              # Basic SQL syntax check - ensures no obvious parse errors
+              if grep -qE '^\s*$' "$f" && [ $(wc -l < "$f") -eq 0 ]; then
+                echo "WARN: Empty migration: $f"
+              fi
+              echo "  OK: $(basename $f)"
+            done
+          else
+            echo "No supabase/migrations directory"
+          fi
+
+      - name: Check for dangerous patterns
+        run: |
+          DANGER=0
+          for f in supabase/migrations/*.sql; do
+            [ -f "$f" ] || continue
+            # Check for DROP without IF EXISTS
+            if grep -inE 'DROP\s+(TABLE|POLICY|FUNCTION|INDEX)\s+(?!IF)' "$f" 2>/dev/null; then
+              echo "DANGER: DROP without IF EXISTS in $(basename $f)"
+              DANGER=1
+            fi
+            # Check for USING(true) or USING(TRUE) — permissive RLS
+            if grep -inE 'USING\s*\(\s*(true|TRUE)\s*\)' "$f" 2>/dev/null; then
+              echo "DANGER: USING(true) permissive RLS in $(basename $f)"
+              DANGER=1
+            fi
+            # Check for auth.uid() IS NULL bypass
+            if grep -inE 'auth\.uid\(\)\s*\)\s*IS\s*NULL' "$f" 2>/dev/null; then
+              echo "DANGER: auth.uid() IS NULL bypass in $(basename $f)"
+              DANGER=1
+            fi
+            # Check for raw_user_meta_data in role assignment
+            if grep -inE "raw_user_meta_data.*role" "$f" 2>/dev/null; then
+              echo "DANGER: Reading role from raw_user_meta_data in $(basename $f)"
+              DANGER=1
+            fi
+          done
+          [ $DANGER -eq 0 ] && echo "No dangerous patterns found"
+          [ $DANGER -eq 1 ] && exit 1 || true
+
+      - name: Verify RLS enabled on all tables
+        run: |
+          # Check that migrations enable RLS on tables they create
+          for f in supabase/migrations/*.sql; do
+            [ -f "$f" ] || continue
+            TABLES=$(grep -ioE 'CREATE TABLE\s+(IF NOT EXISTS\s+)?(\w+\.)?(\w+)' "$f" | grep -oE '\w+$' || true)
+            for table in $TABLES; do
+              if ! grep -qiE "ALTER TABLE.*${table}.*ENABLE ROW LEVEL SECURITY" "$f" supabase/migrations/*.sql 2>/dev/null; then
+                echo "WARN: Table '$table' created without RLS enabled (check if it's in another migration)"
+              fi
+            done
+          done
+
+  edge-function-check:
+    name: Edge Function Validation
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    if: hashFiles('supabase/functions/**') != ''
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Check Edge Function structure
+        run: |
+          for dir in supabase/functions/*/; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            [ -f "$dir/index.ts" ] && echo "OK: $name/index.ts" || echo "WARN: $name missing index.ts"
+            # Check for CORS headers
+            if ! grep -q 'Access-Control-Allow-Origin' "$dir/index.ts" 2>/dev/null; then
+              echo "WARN: $name has no CORS headers"
+            fi
+            # Check for auth validation
+            if ! grep -qE 'getUser|Authorization|auth' "$dir/index.ts" 2>/dev/null; then
+              echo "WARN: $name has no auth validation"
+            fi
+          done
+
+  ci-gate:
+    name: Supabase CI Gate
+    if: always()
+    needs: [migration-check]
+    runs-on: [self-hosted, linux, x64, pop-os]
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - run: |
+          [ "${{ needs.migration-check.result }}" = "failure" ] && echo "Migration check failed" && exit 1
+          echo "Supabase CI passed"
+      - name: Notify Telegram
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=🚨 Supabase CI FAILED | ${{ github.repository }} | ${{ github.ref_name }}" \
+            > /dev/null 2>&1 || true

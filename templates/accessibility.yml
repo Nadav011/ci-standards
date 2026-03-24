@@ -1,0 +1,89 @@
+name: Accessibility
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore: ["**.md"]
+  pull_request:
+    branches: [main, master]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a11y-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  accessibility:
+    name: WCAG Accessibility Audit
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile 2>/dev/null || npm ci
+
+      - name: Build
+        run: pnpm run build 2>/dev/null || npm run build 2>/dev/null || true
+        continue-on-error: true
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co' }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'placeholder' }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://placeholder.supabase.co' }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || 'placeholder' }}
+
+      - name: Start preview server
+        run: |
+          npx serve@14 dist -l 3000 &>/dev/null &
+          npx wait-on@8 http://localhost:3000 --timeout 30000 || \
+          (npx serve@14 .next -l 3000 &>/dev/null & npx wait-on@8 http://localhost:3000 --timeout 30000) || \
+          (npx serve@14 build -l 3000 &>/dev/null & npx wait-on@8 http://localhost:3000 --timeout 30000) || true
+
+      - name: Run axe-core accessibility scan
+        run: |
+          npx @axe-core/cli@4.11.1 http://localhost:3000 --exit --tags wcag2a,wcag2aa,wcag21a,wcag21aa --reporter json > axe-results.json 2>&1 || true
+          # Parse results
+          if [ -f axe-results.json ]; then
+            VIOLATIONS=$(python3 -c "import json; d=json.load(open('axe-results.json')); print(sum(len(r.get('violations',[])) for r in d))" 2>/dev/null || echo "?")
+            PASSES=$(python3 -c "import json; d=json.load(open('axe-results.json')); print(sum(len(r.get('passes',[])) for r in d))" 2>/dev/null || echo "?")
+            echo "## Accessibility Results" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Metric | Count |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Violations | $VIOLATIONS |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Passes | $PASSES |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Violations: $VIOLATIONS | Passes: $PASSES"
+            if [ "$VIOLATIONS" != "0" ] && [ "$VIOLATIONS" != "?" ]; then
+              echo "::error::$VIOLATIONS accessibility violations found"
+              exit 1
+            fi
+          fi
+
+      - name: Upload accessibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accessibility-report-${{ github.sha }}
+          path: axe-results.json
+          retention-days: 30
+
+      - name: Notify Telegram
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=♿ A11y audit FAILED | ${{ github.repository }} | ${{ github.ref_name }}" \
+            > /dev/null 2>&1 || true

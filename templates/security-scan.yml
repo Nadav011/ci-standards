@@ -1,0 +1,189 @@
+name: Security Scan
+# Universal security scan template (Trivy + Semgrep + Gitleaks + SBOM).
+# Can be run standalone or merged into the main CI pipeline.
+# All scanners run in parallel for speed.
+#
+# REQUIRED — fill in before copying to project:
+#   PACKAGE_MANAGER: pnpm       # pnpm | npm
+#   MAIN_BRANCH:     main       # main | master
+#
+# Policy:
+#   CRITICAL CVEs  → exit 1 (blocks merge)
+#   HIGH CVEs      → SARIF upload only (warning, informational)
+#   Semgrep        → continue-on-error (review in GitHub Security tab)
+#   Gitleaks       → exit 1 if secret found
+#   SBOM           → uploaded as artifact, informational
+#
+# NOTE: semgrep needs SEMGREP_APP_TOKEN secret for results to appear in dashboard.
+# NOTE: gitleaks uses pre-installed binary on pop-os runner.
+#       Add .gitleaks.toml for path-based allowlists (see past-mistakes: gitleaks-doc-false-positives).
+
+on:
+  push:
+    branches: [main]            # PLACEHOLDER: MAIN_BRANCH
+  pull_request:
+    branches: [main]            # PLACEHOLDER: MAIN_BRANCH
+  schedule:
+    - cron: '0 9 * * 1'        # Monday 9AM weekly deep scan
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── CVE scan ──────────────────────────────────────────────────────────────────
+  trivy:
+    name: Trivy (CVE + Secrets)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Trivy — CRITICAL findings block merge
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+
+      - name: Trivy — HIGH findings (SARIF upload, warning only)
+        uses: aquasecurity/trivy-action@0.35.0
+        if: always()
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-high.sarif
+        continue-on-error: true
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-high.sarif
+          category: trivy-high
+        continue-on-error: true
+
+  # ── SAST — OWASP Top 10, XSS, SQL injection, React/Next.js patterns ──────────
+  semgrep:
+    name: Semgrep (SAST)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    permissions:
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - uses: semgrep/semgrep-action@v1
+        with:
+          config: auto
+          generateSarif: "1"
+          publishResults: true
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('semgrep.sarif') != ''
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+        continue-on-error: true
+
+  # ── Secret detection ──────────────────────────────────────────────────────────
+  gitleaks:
+    name: Secret Scan (gitleaks)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Run gitleaks
+        run: |
+          if [ -f ".gitleaks.toml" ]; then
+            gitleaks detect --source . --config .gitleaks.toml --verbose --exit-code 1
+          else
+            gitleaks detect --source . --verbose --exit-code 1
+          fi
+
+  # ── Software Bill of Materials (SBOM) ────────────────────────────────────────
+  sbom:
+    name: SBOM + Audit
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+
+      - run: pnpm install --frozen-lockfile      # PLACEHOLDER: npm ci for npm projects
+
+      - name: pnpm audit (critical level)
+        run: pnpm audit --audit-level=critical   # PLACEHOLDER: npm audit --audit-level=critical for npm
+        continue-on-error: true
+
+      - name: Generate SBOM (CycloneDX)
+        run: npx --yes @cyclonedx/cyclonedx-npm@6 --output-file sbom.json --output-format JSON
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.json
+          retention-days: 90    # Keep SBOMs longer for compliance
+
+  # ── Gate: security checks must pass before merge ──────────────────────────────
+  security-gate:
+    name: Security Gate
+    runs-on: [self-hosted, linux, x64, pop-os]
+    if: always()
+    needs: [trivy, gitleaks]    # semgrep + sbom are informational only
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - name: Evaluate security results
+        run: |
+          FAILED=0
+          [ "${{ needs.trivy.result }}"    != "success" ] && FAILED=1 && echo "❌ trivy failed (CRITICAL CVE found)"
+          [ "${{ needs.gitleaks.result }}" != "success" ] && FAILED=1 && echo "❌ gitleaks failed (secret leaked)"
+          [ $FAILED -eq 0 ] && echo "✅ Security gate passed" && exit 0
+          echo "❌ Security gate FAILED — block merge" && exit 1
+
+      - name: Notify Telegram on security failure
+        if: failure()
+        run: |
+          MSG="🚨 *Security Scan FAILED: my-project*%0A%0A❌ Critical CVE or secret leaked%0ABranch: \`${{ github.ref_name }}\`%0A%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # PLACEHOLDER: PROJECT_NAME in msg above
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true

@@ -1,0 +1,99 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main, master]
+
+permissions:
+  contents: read
+  deployments: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Vercel
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Install Vercel CLI
+        run: npm i -g vercel@latest
+
+      - name: Pull Vercel Environment
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy
+        id: deploy
+        run: |
+          URL=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/**
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign deployment attestation
+        if: success()
+        run: |
+          echo "${{ steps.deploy.outputs.url }}" > deployment-receipt.txt
+          cosign sign-blob deployment-receipt.txt \
+            --output-certificate deployment-receipt.pem \
+            --output-signature deployment-receipt.sig \
+            --yes
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          [ "$STATUS" = "success" ] && ICON="🚀" || ICON="🚨"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=${ICON} Deploy ${{ github.repository }}: ${STATUS} | ${{ github.ref_name }}" \
+            > /dev/null 2>&1 || true
+
+  deploy-blocked:
+    name: Deploy Blocked (CI Failed)
+    if: github.event.workflow_run.conclusion != 'success'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - run: |
+          echo "Deploy blocked — CI workflow did not succeed"
+          echo "CI conclusion: ${{ github.event.workflow_run.conclusion }}"
+          exit 1
+      - name: Notify Telegram
+        if: always()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=⛔ Deploy BLOCKED — CI failed | ${{ github.repository }} | ${{ github.ref_name }}" \
+            > /dev/null 2>&1 || true

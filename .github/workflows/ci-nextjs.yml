@@ -21,6 +21,10 @@ on:
         required: false
       LHCI_GITHUB_APP_TOKEN:
         required: false
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -36,14 +40,21 @@ jobs:
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: ${{ inputs.package-manager }}
       - name: Install (pnpm)
         if: inputs.package-manager == 'pnpm'
-        run: corepack enable && pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
       - name: Install (npm)
         if: inputs.package-manager == 'npm'
         run: npm ci
@@ -58,7 +69,14 @@ jobs:
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
@@ -73,7 +91,14 @@ jobs:
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
@@ -86,12 +111,18 @@ jobs:
   # trivy: CVEs in deps + hardcoded secrets. CRITICAL = blocks merge.
   trivy:
     name: Trivy (CVE + Secrets)
+    permissions:
+      contents: read
+      security-events: write
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 10
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
       - name: Trivy — CRITICAL findings block merge
-        uses: aquasecurity/trivy-action@v0.30.0
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           scan-type: fs
           scan-ref: .
@@ -100,7 +131,7 @@ jobs:
           ignore-unfixed: true
           format: table
       - name: Trivy — HIGH findings (warning only)
-        uses: aquasecurity/trivy-action@v0.30.0
+        uses: aquasecurity/trivy-action@v0.35.0
         if: always()
         with:
           scan-type: fs
@@ -125,6 +156,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 10
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
       - uses: semgrep/semgrep-action@v1
         with:
@@ -141,6 +175,9 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: gitleaks/gitleaks-action@v2
@@ -155,7 +192,14 @@ jobs:
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
@@ -171,13 +215,42 @@ jobs:
         with: { name: sbom, path: sbom.json, retention-days: 30 }
   # ─────────────────────────────────────────────────────────────────────────
 
+  unit-test:
+    name: Unit Tests
+    needs: install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ inputs.node-version }}" }
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('*lock*') }}
+      - run: npx vitest run --maxWorkers=2
+
   build:
     name: Build
     needs: [typecheck, lint]
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 15
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: 10.30.3
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
       - uses: actions/cache/restore@v4
@@ -193,18 +266,34 @@ jobs:
     name: CI Gate
     runs-on: [self-hosted, linux, x64, pop-os]
     if: always()
-    needs: [typecheck, lint, trivy, gitleaks, build]
+    needs: [typecheck, lint, unit-test, trivy, gitleaks, build]
     steps:
-      - run: |
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - name: Evaluate gates
+        run: |
           FAILED=0
-          [ "${{ needs.typecheck.result }}" != "success" ] && FAILED=1 && echo "❌ typecheck"
-          [ "${{ needs.lint.result }}"      != "success" ] && FAILED=1 && echo "❌ lint"
-          [ "${{ needs.trivy.result }}"     != "success" ] && FAILED=1 && echo "❌ trivy (CRITICAL CVE found)"
-          [ "${{ needs.gitleaks.result }}"  != "success" ] && FAILED=1 && echo "❌ gitleaks (secret leaked)"
-          [ "${{ needs.build.result }}"     != "success" ] && FAILED=1 && echo "❌ build"
+          [ "${{ needs.typecheck.result }}"  != "success" ] && FAILED=1 && echo "❌ typecheck"
+          [ "${{ needs.lint.result }}"       != "success" ] && FAILED=1 && echo "❌ lint"
+          [ "${{ needs.unit-test.result }}"  != "success" ] && FAILED=1 && echo "❌ unit-test"
+          [ "${{ needs.trivy.result }}"      != "success" ] && FAILED=1 && echo "❌ trivy (CRITICAL CVE found)"
+          [ "${{ needs.gitleaks.result }}"   != "success" ] && FAILED=1 && echo "❌ gitleaks (secret leaked)"
+          [ "${{ needs.build.result }}"      != "success" ] && FAILED=1 && echo "❌ build"
           [ $FAILED -eq 0 ] && echo "✅ All checks passed" && exit 0
           echo "❌ CI failed" && exit 1
-
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          MSG="🚨 *${{ github.event.repository.name }} CI FAILED*%0ABranch: \`${{ github.ref_name }}\`%0ABy: ${{ github.actor }}%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          MSG="✅ *${{ github.event.repository.name }} CI PASSED*%0ABranch: \`${{ github.ref_name }}\`%0ABy: ${{ github.actor }}%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
 
   deploy:
     name: Deploy to Vercel
@@ -217,6 +306,9 @@ jobs:
     timeout-minutes: 10
     environment: production
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }
@@ -242,6 +334,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 10
     steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "${{ inputs.node-version }}" }

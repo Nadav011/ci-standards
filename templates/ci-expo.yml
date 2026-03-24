@@ -1,0 +1,176 @@
+name: CI — Expo React Native
+# Standalone CI template for Expo/React Native projects.
+# Projects: israeli-finance-app
+#
+# REQUIRED — fill in before copying:
+#   MAIN_BRANCH:      main          # main | master
+#   PACKAGE_MANAGER:  pnpm          # pnpm | npm
+
+on:
+  push:
+    branches: [main]                # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore: ["**.md"]
+  pull_request:
+    branches: [main]                # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CI: true
+  NODE_OPTIONS: "--max-old-space-size=4096"
+
+jobs:
+  install:
+    name: Install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/cache/save@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+  typecheck:
+    name: TypeCheck
+    needs: install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+      - run: npx tsc --noEmit
+
+  lint:
+    name: Lint
+    needs: install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+      - run: pnpm run lint
+        continue-on-error: true
+
+  expo-doctor:
+    name: Expo Doctor
+    needs: install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+      - run: npx expo-doctor@latest
+        continue-on-error: true
+
+  trivy:
+    name: Trivy (CVE + Secrets)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Trivy — CRITICAL findings block merge
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+
+  gitleaks:
+    name: Secret Scan (gitleaks)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: false
+
+  ci-gate:
+    name: CI Gate
+    runs-on: [self-hosted, linux, x64, pop-os]
+    if: always()
+    needs: [typecheck, trivy, gitleaks]
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - name: Evaluate gates
+        run: |
+          FAILED=0
+          [ "${{ needs.typecheck.result }}" != "success" ] && FAILED=1 && echo "❌ typecheck"
+          [ "${{ needs.trivy.result }}"     != "success" ] && FAILED=1 && echo "❌ trivy (CRITICAL CVE)"
+          [ "${{ needs.gitleaks.result }}"  != "success" ] && FAILED=1 && echo "❌ gitleaks (secret)"
+          [ $FAILED -eq 0 ] && echo "✅ Expo CI passed" && exit 0
+          echo "❌ Expo CI failed" && exit 1
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          MSG="🚨 *${{ github.repository }} Expo CI FAILED*%0ABranch: \`${{ github.ref_name }}\`%0ABy: ${{ github.actor }}%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          MSG="✅ *${{ github.repository }} Expo CI PASSED*%0ABranch: \`${{ github.ref_name }}\`"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
