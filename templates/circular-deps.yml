@@ -1,0 +1,68 @@
+name: Circular Dependencies
+
+on:
+  push:
+    branches: [main, master]
+    paths: ["src/**"]
+  pull_request:
+    branches: [main, master]
+    paths: ["src/**"]
+  schedule:
+    - cron: '7 8 * * 1'  # Monday 8:07 AM (off-minute)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: circular-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  madge:
+    name: Circular Dependency Check
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile 2>/dev/null || npm ci
+
+      - name: Check for circular dependencies
+        id: madge
+        run: |
+          set +e
+          OUTPUT=$(npx madge@8.0.0 --circular --extensions ts,tsx src/ 2>&1)
+          EXIT_CODE=$?
+          echo "$OUTPUT"
+
+          if echo "$OUTPUT" | grep -q "Found [1-9]"; then
+            CYCLES=$(echo "$OUTPUT" | grep "Found " | grep -o "[0-9]*")
+            echo "## Circular Dependencies Found" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::$CYCLES circular dependencies detected"
+          else
+            echo "## No Circular Dependencies" >> "$GITHUB_STEP_SUMMARY"
+            echo "Clean import graph." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=🔄 Circular deps check FAILED | ${{ github.repository }} | ${{ github.ref_name }}" \
+            > /dev/null 2>&1 || true

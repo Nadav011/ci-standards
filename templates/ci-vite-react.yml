@@ -1,0 +1,393 @@
+name: CI
+# Template for Vite+React projects.
+# Projects using this: mexicani, shifts, brain, hatumdigital, signature-pro, nadavai
+#
+# REQUIRED — fill in before copying to project:
+#   PACKAGE_MANAGER: pnpm       # pnpm | npm (Z/cash uses npm — only exception)
+#   PROJECT_NAME:    my-project # used in Telegram messages
+#   MAIN_BRANCH:     main       # main | master
+#   TEST_CMD:        pnpm vitest run --maxWorkers=2 --reporter=dot
+#   BUILD_CMD:       pnpm run build
+#   TYPECHECK_CMD:   pnpm run typecheck
+#   LINT_CMD:        pnpm run lint
+#   LOCKFILE:        pnpm-lock.yaml   # pnpm-lock.yaml | package-lock.json
+#   BUNDLE_LIMIT_KB: 5000             # total dist/assets/ JS limit in KB
+#   INITIAL_LOAD_LIMIT_KB: 500        # initial HTML-referenced JS limit in KB
+#
+# OPTIONAL env vars for build (uncomment as needed):
+#   VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY
+#   NEXT_PUBLIC_* equivalents for other frameworks
+#
+# NOTE: Z/cash project uses npm — replace all `pnpm` with `npm ci` / `npm run` there.
+
+on:
+  push:
+    branches: [main]            # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/CODEOWNERS"
+  pull_request:
+    branches: [main]            # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/CODEOWNERS"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  CI: true
+  NODE_ENV: test
+  NODE_OPTIONS: "--max-old-space-size=4096"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── Install once, shared via cache ──────────────────────────────────────────
+  install:
+    name: Install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+      - run: pnpm install --frozen-lockfile      # PLACEHOLDER: npm ci --legacy-peer-deps for npm projects
+      - uses: actions/cache/save@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}  # PLACEHOLDER: LOCKFILE
+
+  # ── Fast checks (parallel) ───────────────────────────────────────────────────
+  typecheck:
+    name: TypeCheck
+    needs: install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}  # PLACEHOLDER: LOCKFILE
+      - name: Install if cache miss
+        run: '[ -d node_modules ] || pnpm install --frozen-lockfile'    # PLACEHOLDER: npm ci for npm
+      - run: pnpm run typecheck                  # PLACEHOLDER: TYPECHECK_CMD
+
+  lint:
+    name: Lint (Biome)
+    needs: install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Setup Biome
+        uses: biomejs/setup-biome@v2
+        with:
+          version: "2.4.4"
+      - name: Biome CI (lint + format check)
+        run: biome ci .
+
+  # ── Security (independent — no need to wait for install) ────────────────────
+  trivy:
+    name: Trivy (CVE + Secrets)
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Trivy — CRITICAL findings block merge
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+      - name: Trivy — HIGH findings (warning)
+        uses: aquasecurity/trivy-action@0.35.0
+        if: always()
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-results.sarif
+        continue-on-error: true
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+        continue-on-error: true
+
+  semgrep:
+    name: Semgrep (SAST)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - uses: semgrep/semgrep-action@v1
+        with:
+          config: auto
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  gitleaks:
+    name: Secret Scan
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Run gitleaks
+        run: |
+          if [ -f ".gitleaks.toml" ]; then
+            gitleaks detect --source . --config .gitleaks.toml --verbose --exit-code 1
+          else
+            gitleaks detect --source . --verbose --exit-code 1
+          fi
+
+  # ── Unit tests ───────────────────────────────────────────────────────────────
+  unit-test:
+    name: Tests
+    needs: install
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}  # PLACEHOLDER: LOCKFILE
+      - name: Install if cache miss
+        run: '[ -d node_modules ] || pnpm install --frozen-lockfile'    # PLACEHOLDER: npm ci for npm
+      - name: Run tests
+        run: pnpm vitest run --maxWorkers=2 --reporter=dot --reporter=blob --reporter=json-summary --outputFile.blob=.vitest-reports/blob.json  # PLACEHOLDER: TEST_CMD
+        # NOTE: vitest.config.ts must include reporters: ['json-summary'] and coverage.reporter: ['json-summary', 'json', 'text']
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
+      - name: Coverage PR Report
+        if: github.event_name == 'pull_request'
+        uses: davelosert/vitest-coverage-report-action@v2
+        with:
+          json-summary-path: coverage/coverage-summary.json
+          json-path: coverage/coverage-final.json
+          vite-config-path: vitest.config.ts
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: test-report-${{ github.sha }}
+          path: .vitest-reports/
+          retention-days: 7
+
+  # ── Build ────────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    needs: [typecheck, lint]
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}  # PLACEHOLDER: LOCKFILE
+      - name: Install if cache miss
+        run: '[ -d node_modules ] || pnpm install --frozen-lockfile'    # PLACEHOLDER: npm ci for npm
+      - name: Build
+        run: pnpm run build                      # PLACEHOLDER: BUILD_CMD
+        env:
+          NODE_OPTIONS: "--max-old-space-size=7168"
+          # PLACEHOLDER: uncomment env vars needed by build
+          # VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://ci-placeholder.supabase.co' }}
+          # VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || 'ci-placeholder-anon-key' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-dist
+          path: dist/
+          retention-days: 3
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          subject-path: dist/**
+
+  # ── Bundle size guard ────────────────────────────────────────────────────────
+  bundle-check:
+    name: Bundle Size Guard
+    needs: build
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-dist
+          path: dist/
+      - name: Check initial load size
+        run: |
+          python3 -c "
+          import re, os, sys
+          html = open('dist/index.html').read()
+          scripts = re.findall(r'src=\"(/[^\"]+\.js)\"', html)
+          total = sum(os.path.getsize('dist' + s) // 1024 for s in scripts if os.path.exists('dist' + s))
+          print(f'Initial load: {total} KB')
+          limit = 500  # PLACEHOLDER: INITIAL_LOAD_LIMIT_KB
+          if total > limit:
+              print(f'FAILED: {total} KB exceeds {limit} KB limit')
+              sys.exit(1)
+          print(f'PASSED: {total} KB <= {limit} KB')
+          "
+      - name: Check total bundle size
+        run: |
+          TOTAL=$(find dist/assets -name "*.js" -exec du -k {} + | awk '{sum+=$1} END{print sum}')
+          echo "Total bundle: ${TOTAL} KB"
+          LIMIT=5000  # PLACEHOLDER: BUNDLE_LIMIT_KB
+          if [ "${TOTAL}" -gt "${LIMIT}" ]; then
+            echo "FAILED: ${TOTAL} KB exceeds ${LIMIT} KB limit"
+            exit 1
+          fi
+          echo "PASSED: ${TOTAL} KB <= ${LIMIT} KB"
+
+  # ── SBOM generation ──────────────────────────────────────────────────────────
+  sbom:
+    name: SBOM
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    needs: [install]
+    continue-on-error: true
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+      - name: Enable pnpm
+        run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Generate SBOM
+        run: npx --yes @cyclonedx/cyclonedx-npm@6 --output-format json --output-file sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cdx.json
+          retention-days: 90
+
+  # ── CI Gate — deploy gating depends on this ──────────────────────────────────
+  ci-gate:
+    name: CI Gate
+    runs-on: [self-hosted, linux, x64, pop-os]
+    if: always()
+    needs: [typecheck, lint, unit-test, trivy, gitleaks, build, bundle-check]
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - name: Evaluate all jobs
+        run: |
+          echo "## CI Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| TypeCheck | ${{ needs.typecheck.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | ${{ needs.unit-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy (CVE) | ${{ needs.trivy.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Gitleaks | ${{ needs.gitleaks.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bundle Check | ${{ needs.bundle-check.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          FAILED=0
+          [ "${{ needs.typecheck.result }}" != "success" ] && FAILED=1 && echo "❌ typecheck failed"
+          [ "${{ needs.lint.result }}"      != "success" ] && FAILED=1 && echo "❌ lint failed"
+          [ "${{ needs.unit-test.result }}" != "success" ] && FAILED=1 && echo "❌ unit-test failed"
+          [ "${{ needs.trivy.result }}"     != "success" ] && FAILED=1 && echo "❌ trivy failed (CRITICAL CVE)"
+          [ "${{ needs.gitleaks.result }}"  != "success" ] && FAILED=1 && echo "❌ gitleaks failed (secret leaked)"
+          [ "${{ needs.build.result }}"     != "success" ] && FAILED=1 && echo "❌ build failed"
+          [ "${{ needs.bundle-check.result }}" != "success" ] && FAILED=1 && echo "❌ bundle-check failed (size limit exceeded)"
+          [ $FAILED -eq 0 ] && echo "✅ All checks passed" && exit 0
+          echo "❌ CI Gate FAILED" && exit 1
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          FAILED_JOBS=""
+          [ "${{ needs.typecheck.result }}" = "failure" ] && FAILED_JOBS="${FAILED_JOBS}❌TypeCheck " || true
+          [ "${{ needs.lint.result }}"      = "failure" ] && FAILED_JOBS="${FAILED_JOBS}❌Lint " || true
+          [ "${{ needs.unit-test.result }}" = "failure" ] && FAILED_JOBS="${FAILED_JOBS}❌Tests " || true
+          [ "${{ needs.trivy.result }}"     = "failure" ] && FAILED_JOBS="${FAILED_JOBS}❌Trivy " || true
+          [ "${{ needs.gitleaks.result }}"  = "failure" ] && FAILED_JOBS="${FAILED_JOBS}❌Gitleaks " || true
+          [ "${{ needs.build.result }}"     = "failure" ] && FAILED_JOBS="${FAILED_JOBS}❌Build " || true
+          [ "${{ needs.bundle-check.result }}" = "failure" ] && FAILED_JOBS="${FAILED_JOBS}❌BundleCheck " || true
+          MSG="🚨 *my-project CI FAILED*%0A%0ABranch: \`${{ github.ref_name }}\`%0ABy: ${{ github.actor }}%0AFailed: ${FAILED_JOBS}%0A%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # PLACEHOLDER: PROJECT_NAME in the msg above
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          MSG="✅ *my-project CI PASSED*%0A%0ABranch: \`${{ github.ref_name }}\`%0ABy: ${{ github.actor }}%0A%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # PLACEHOLDER: PROJECT_NAME in the msg above
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true

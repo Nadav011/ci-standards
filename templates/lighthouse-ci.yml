@@ -1,0 +1,112 @@
+name: Lighthouse CI
+# Universal Lighthouse CI template.
+# Runs after build — serves built artifact locally, then runs LHCI.
+#
+# REQUIRED — fill in before copying to project:
+#   PACKAGE_MANAGER:  pnpm        # pnpm | npm
+#   PROJECT_TYPE:     vite        # vite | nextjs
+#   MAIN_BRANCH:      main        # main | master
+#
+# VITE projects:  artifact = build-dist, served from dist/, port 4173
+# NEXT.JS projects: artifact = build-out, served by `pnpm next start`, port 3000
+#
+# Requires .lighthouserc.js (or .lighthouserc.json) in project root.
+# Minimal .lighthouserc.js example:
+#   module.exports = {
+#     ci: {
+#       collect: { url: ['http://localhost:4173'], numberOfRuns: 1 },
+#       assert: {
+#         assertions: {
+#           'categories:performance': ['warn', { minScore: 0.8 }],
+#           'categories:accessibility': ['error', { minScore: 0.9 }],
+#         }
+#       },
+#       upload: { target: 'temporary-public-storage' },
+#     }
+#   };
+
+on:
+  push:
+    branches: [main]            # PLACEHOLDER: MAIN_BRANCH
+  pull_request:
+    branches: [main]            # PLACEHOLDER: MAIN_BRANCH
+  workflow_dispatch:
+
+concurrency:
+  group: lighthouse-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lighthouse:
+    name: Lighthouse CI
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+
+      - run: pnpm install --frozen-lockfile      # PLACEHOLDER: npm ci for npm projects
+
+      # ── VITE: build + serve locally ──────────────────────────────────────────
+      # PLACEHOLDER: Keep this block for vite projects, remove for nextjs
+      - name: Build (Vite)
+        run: pnpm run build                      # PLACEHOLDER: BUILD_CMD
+        env:
+          NODE_OPTIONS: "--max-old-space-size=7168"
+          # PLACEHOLDER: uncomment needed env vars
+          # VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://ci-placeholder.supabase.co' }}
+          # VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || 'ci-placeholder-anon-key' }}
+
+      - name: Serve built artifact (Vite)
+        run: npx serve@14 dist --single --listen 4173 &
+        # PLACEHOLDER: for nextjs replace with: pnpm next start --port 3000 &
+
+      - name: Wait for local server
+        run: npx wait-on@8 http://localhost:4173 --timeout 30000
+        # PLACEHOLDER: for nextjs replace port with 3000
+
+      # ── NEXT.JS: start production server ─────────────────────────────────────
+      # PLACEHOLDER: Uncomment for nextjs, remove build + serve blocks above
+      # - name: Build (Next.js)
+      #   run: pnpm run build
+      #   env:
+      #     NODE_OPTIONS: "--max-old-space-size=7168"
+      #     NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL || 'https://ci-placeholder.supabase.co' }}
+      #     NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'ci-placeholder-anon-key' }}
+      # - name: Start Next.js production server
+      #   run: pnpm next start --port 3000 &
+      # - name: Wait for server
+      #   run: npx wait-on@8 http://localhost:3000 --timeout 30000
+
+      - name: Run Lighthouse CI
+        run: npx @lhci/cli@0.15.1 autorun --collect.url=http://localhost:4173
+        # PLACEHOLDER: for nextjs replace port with 3000
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+      - name: Upload LHCI report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lhci-results
+          path: .lighthouseci/
+          retention-days: 7
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=🔦 Lighthouse CI FAILED | ${{ github.repository }} | ${{ github.ref_name }}" \
+            > /dev/null 2>&1 || true

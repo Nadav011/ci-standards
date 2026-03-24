@@ -1,21 +1,17 @@
-name: CI — Flutter (Reusable)
-# Called from any Flutter project with:
-#   uses: Nadav011/ci-standards/.github/workflows/ci-flutter.yml@main
+name: CI — Flutter
+# Standalone Flutter CI template (not reusable workflow_call).
+# Copy to project .github/workflows/ and customize as needed.
+#
+# REQUIRED — fill in before copying:
+#   MAIN_BRANCH:      main          # main | master
+#   FLUTTER_VERSION:  3.x           # or pin to specific version
+#   JAVA_VERSION:     17
 
 on:
-  workflow_call:
-    inputs:
-      flutter-version:
-        type: string
-        default: "3.x"
-      java-version:
-        type: string
-        default: "17"
-    secrets:
-      TELEGRAM_BOT_TOKEN:
-        required: false
-      TELEGRAM_CHAT_ID:
-        required: false
+  push:
+    branches: [main]                # PLACEHOLDER: MAIN_BRANCH
+  pull_request:
+    branches: [main]                # PLACEHOLDER: MAIN_BRANCH
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -32,10 +28,10 @@ jobs:
           egress-policy: audit
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "${{ inputs.java-version }}" }
+        with: { distribution: temurin, java-version: "17" }
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ inputs.flutter-version }}
+          flutter-version: "3.x"
           cache: true
       - run: flutter pub get
       - run: flutter analyze --fatal-infos
@@ -51,10 +47,10 @@ jobs:
           egress-policy: audit
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "${{ inputs.java-version }}" }
+        with: { distribution: temurin, java-version: "17" }
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ inputs.flutter-version }}
+          flutter-version: "3.x"
           cache: true
       - run: flutter pub get
       # very_good_cli: fail-fast + coverage enforcement (replaces `flutter test`)
@@ -67,7 +63,6 @@ jobs:
           retention-days: 7
 
   # ── SECURITY LAYER ────────────────────────────────────────────────────────
-  # trivy: CVEs in Dart/pub deps + hardcoded secrets. CRITICAL = blocks merge.
   trivy:
     name: Trivy (CVE + Secrets)
     permissions:
@@ -147,6 +142,12 @@ jobs:
       - name: Notify Telegram on failure
         if: failure()
         run: |
-          MSG="🚨 ci-standards/${{ github.event.repository.name }} Flutter CI FAILED | ${{ github.ref_name }} | ${{ github.actor }}"
-          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG" > /dev/null 2>&1 || true
-
+          MSG="🚨 *${{ github.repository }} Flutter CI FAILED*%0ABranch: \`${{ github.ref_name }}\`%0ABy: ${{ github.actor }}%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          MSG="✅ *${{ github.repository }} Flutter CI PASSED*%0ABranch: \`${{ github.ref_name }}\`%0ABy: ${{ github.actor }}"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
