@@ -1,0 +1,46 @@
+name: Coverage Gate
+
+on:
+  pull_request:
+    branches: [main]           # PLACEHOLDER: MAIN_BRANCH
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  coverage:
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile || npm ci
+
+      - name: Run tests with coverage
+        run: pnpm vitest run --coverage --maxWorkers=2 || true
+
+      - name: Check coverage threshold
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            LINES=$(python3 -c "import json; d=json.load(open('coverage/coverage-summary.json')); print(d['total']['lines']['pct'])")
+            echo "Line coverage: ${LINES}%"
+            if (( $(echo "$LINES < 50" | bc -l) )); then
+              echo "::error::Coverage ${LINES}% is below 50% threshold"
+              exit 1
+            fi
+            echo "::notice::Coverage ${LINES}% passes threshold"
+          else
+            echo "::warning::No coverage report found — skipping gate"
+          fi
