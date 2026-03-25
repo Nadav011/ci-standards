@@ -1,0 +1,461 @@
+name: AI Self-Heal CI
+# Watches for CI failures on PR branches and dispatches a Claude agent to
+# diagnose the root cause, apply a fix, verify it, and push the result.
+#
+# REQUIRED — fill in before copying to project:
+#   WATCHED_WORKFLOW:    "CI"        # exact name of the CI workflow to watch
+#   MAIN_BRANCH:         main        # main | master (heal is SKIPPED on this branch)
+#   PROJECT_NAME:        my-project  # used in Telegram notifications
+#   PACKAGE_MANAGER:     pnpm        # pnpm | npm
+#
+# REQUIRED SECRETS:
+#   TELEGRAM_BOT_TOKEN     — Telegram bot token
+#   TELEGRAM_CHAT_ID       — Telegram chat / group ID
+#   GITHUB_TOKEN           — already provided by Actions, no extra setup needed
+#
+# AUTHENTICATION:
+#   Claude CLI uses OAuth (same user session as the self-hosted runner).
+#   The runner process runs as `nadavcohen` — same user that authenticated claude CLI.
+#   No ANTHROPIC_API_KEY secret needed when using self-hosted runners with OAuth auth.
+#   If using API key auth instead, set CLAUDE_API_KEY secret and uncomment the env line below.
+#
+# Attempt cap: max 3 auto-heal attempts per branch (enforced via a
+# `.claude/heal-counter/<branch-slug>` counter file committed on each attempt).
+# On attempt 4+ the job exits without running Claude and posts a Telegram alert.
+#
+# Safety constraints hard-coded into the Claude prompt:
+#   • NEVER skip, disable, or delete tests
+#   • NEVER add `// @ts-ignore`, `any`, or `eslint-disable`
+#   • NEVER modify CI workflow files themselves
+#   • Must verify fix with `pnpm typecheck && pnpm lint` before committing
+#
+# How the attempt counter works:
+#   1. checkout the PR branch (fetch-depth 0 so we can push back)
+#   2. read/increment .claude/heal-counter/<slug> (plain integer file)
+#   3. if count > 3 → notify Telegram + exit (no Claude call)
+#   4. commit the incremented counter + any Claude changes in one push
+#      (counter file is tracked; adding it to .gitignore is optional but not done here)
+
+on:
+  workflow_run:
+    workflows: ["CI"]              # PLACEHOLDER: WATCHED_WORKFLOW
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Failed workflow run ID to heal (leave blank to use latest on branch)"
+        required: false
+        default: ""
+      branch:
+        description: "PR branch to target (required for manual trigger)"
+        required: true
+        default: ""
+
+concurrency:
+  # One healer per branch at a time — prevents parallel healers stomping each other
+  group: ai-self-heal-${{ github.event.workflow_run.head_branch || inputs.branch }}
+  cancel-in-progress: false        # Let the running healer finish; queue the next
+
+permissions:
+  contents: write                  # push commits
+  pull-requests: write             # add PR comments
+  actions: read                    # read workflow run logs via gh CLI
+
+env:
+  NODE_OPTIONS: "--max-old-space-size=4096"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── Guard: only heal PR branches, only on failure ─────────────────────────────
+  guard:
+    name: Should Heal?
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 2
+    outputs:
+      should-heal: ${{ steps.check.outputs.should_heal }}
+      branch: ${{ steps.check.outputs.branch }}
+      run-id: ${{ steps.check.outputs.run_id }}
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - name: Determine heal eligibility
+        id: check
+        run: |
+          # ── Resolve branch and run-id (event vs manual) ──────────────────────
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH="${{ inputs.branch }}"
+            RUN_ID="${{ inputs.run_id }}"
+            # For manual trigger we always attempt (conclusion unknown)
+            CONCLUSION="failure"
+          else
+            BRANCH="${{ github.event.workflow_run.head_branch }}"
+            RUN_ID="${{ github.event.workflow_run.id }}"
+            CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+          fi
+
+          echo "branch=$BRANCH"       >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID"       >> "$GITHUB_OUTPUT"
+
+          # ── Skip if the workflow didn't fail ─────────────────────────────────
+          if [ "$CONCLUSION" != "failure" ]; then
+            echo "Workflow conclusion is '${CONCLUSION}' — nothing to heal."
+            echo "should_heal=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ── Skip if this is main/master (safety: never auto-commit to trunk) ─
+          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+            echo "Branch is '${BRANCH}' — skipping heal (trunk branches are off-limits)."
+            echo "should_heal=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ── Skip if branch is empty (shouldn't happen, but guard anyway) ─────
+          if [ -z "$BRANCH" ]; then
+            echo "Branch name is empty — cannot heal."
+            echo "should_heal=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_heal=true" >> "$GITHUB_OUTPUT"
+          echo "Branch '${BRANCH}' (run ${RUN_ID}) is eligible for healing."
+
+  # ── Main heal job ─────────────────────────────────────────────────────────────
+  heal:
+    name: Diagnose + Fix
+    needs: guard
+    if: needs.guard.outputs.should-heal == 'true'
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 30
+    env:
+      BRANCH: ${{ needs.guard.outputs.branch }}
+      FAILED_RUN_ID: ${{ needs.guard.outputs.run-id }}
+      # Claude CLI uses OAuth on self-hosted runners (same user session).
+      # Uncomment below ONLY if using API key auth instead of OAuth:
+      # ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      # ── 1. Checkout the failing branch ─────────────────────────────────────
+      - name: Checkout failing branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.branch }}
+          fetch-depth: 0             # need full history to push back
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      # ── 2. Check + enforce attempt counter (max 3) ─────────────────────────
+      - name: Check attempt counter
+        id: counter
+        run: |
+          # Sanitise branch name → safe filename slug
+          SLUG=$(echo "$BRANCH" | tr '/' '-' | tr -cd '[:alnum:]-_' | cut -c1-80)
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+
+          COUNTER_DIR=".claude/heal-counter"
+          COUNTER_FILE="$COUNTER_DIR/$SLUG"
+
+          mkdir -p "$COUNTER_DIR"
+
+          if [ -f "$COUNTER_FILE" ]; then
+            COUNT=$(cat "$COUNTER_FILE" | tr -d '[:space:]')
+            # Validate it's a number
+            if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then COUNT=0; fi
+          else
+            COUNT=0
+          fi
+
+          NEXT=$((COUNT + 1))
+          echo "attempt=$NEXT" >> "$GITHUB_OUTPUT"
+
+          if [ "$NEXT" -gt 3 ]; then
+            echo "over_limit=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Auto-heal limit reached ($COUNT/3 attempts) for branch '$BRANCH'. Manual intervention required."
+          else
+            echo "over_limit=false" >> "$GITHUB_OUTPUT"
+            echo "$NEXT" > "$COUNTER_FILE"
+            echo "Attempt $NEXT/3 for branch '$BRANCH'"
+          fi
+
+      - name: Notify Telegram — limit reached
+        if: steps.counter.outputs.over_limit == 'true'
+        run: |
+          MSG="🛑 *my-project Auto-Heal: Limit Reached*%0A%0ABranch: \`${BRANCH}\`%0AAttempts: 3/3 exhausted%0A%0A👤 Manual fix required.%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # PLACEHOLDER: PROJECT_NAME in msg above
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+
+      - name: Abort if limit reached
+        if: steps.counter.outputs.over_limit == 'true'
+        run: |
+          echo "Auto-heal limit reached. Exiting without running Claude."
+          exit 0
+
+      # ── 3. Extract failure logs ─────────────────────────────────────────────
+      - name: Extract failure logs
+        id: logs
+        run: |
+          echo "Fetching logs for run ${FAILED_RUN_ID}..."
+
+          # Pull the last 200 lines of failed-step logs
+          gh run view "$FAILED_RUN_ID" --log-failed 2>&1 | tail -200 > /tmp/ci-failure-logs.txt
+
+          # Also capture the structured job/step failure summary
+          gh run view "$FAILED_RUN_ID" --json jobs \
+            --jq '.jobs[] | select(.conclusion == "failure") | {job: .name, steps: [.steps[] | select(.conclusion == "failure") | {step: .name, conclusion: .conclusion}]}' \
+            > /tmp/ci-failure-summary.json 2>/dev/null || true
+
+          echo "=== FAILURE SUMMARY ===" && cat /tmp/ci-failure-summary.json || true
+          echo "=== LOG TAIL (last 200 lines) ===" && cat /tmp/ci-failure-logs.txt
+
+          # Write combined context for Claude
+          {
+            echo "=== FAILING JOBS / STEPS ==="
+            cat /tmp/ci-failure-summary.json
+            echo ""
+            echo "=== RAW LOG (last 200 lines) ==="
+            cat /tmp/ci-failure-logs.txt
+          } > /tmp/ci-context.txt
+
+          # Escape for GITHUB_OUTPUT (truncate to 60K chars to stay within limits)
+          LOG_EXCERPT=$(head -c 60000 /tmp/ci-context.txt | base64 -w 0)
+          echo "log_b64=$LOG_EXCERPT" >> "$GITHUB_OUTPUT"
+
+      # ── 4. Install dependencies so Claude can run typecheck/lint ───────────
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+
+      - name: Install dependencies
+        run: |
+          if [ -f "pnpm-lock.yaml" ]; then
+            pnpm install --frozen-lockfile
+          elif [ -f "package-lock.json" ]; then
+            npm ci
+          fi
+
+      # ── 5. Write Claude prompt file ────────────────────────────────────────
+      # Prompt is written to /tmp/claude-prompt.txt rather than inline in the
+      # shell command. This avoids YAML parsing issues with unindented heredocs
+      # and keeps the prompt readable and auditable.
+      - name: Write Claude prompt
+        run: |
+          ATTEMPT="${{ steps.counter.outputs.attempt }}"
+          FAILURE_CONTEXT=$(cat /tmp/ci-context.txt)
+
+          python3 - <<PYEOF
+          import os, textwrap
+          attempt = os.environ.get("ATTEMPT", "?")
+          ctx = open("/tmp/ci-context.txt").read()
+          prompt = textwrap.dedent(f"""
+            You are a senior engineer performing automated CI self-healing.
+            A CI pipeline has failed on a PR branch. Your job is to:
+              1. Read the failure logs below and diagnose the ROOT CAUSE.
+              2. Locate and read the relevant source files.
+              3. Apply a minimal, correct fix.
+              4. Verify the fix with: pnpm typecheck && pnpm lint
+                 (If the project uses npm, run: npm run typecheck && npm run lint)
+              5. Report your findings in this EXACT format at the end of your response:
+                   ROOT CAUSE: <one sentence>
+                   FILES CHANGED: <comma-separated list>
+                   VERIFICATION: <exact output of typecheck + lint commands>
+                   STATUS: FIXED | UNFIXABLE
+
+            HARD CONSTRAINTS (violation means the heal attempt is invalid):
+              NEVER skip, disable, comment out, or delete any test
+              NEVER add @ts-ignore, eslint-disable, or @ts-expect-error (unless already present)
+              NEVER add 'any' type annotations
+              NEVER modify files under .github/workflows/
+              NEVER modify any CI configuration files
+              NEVER add TODO comments and leave work unfinished
+              ALWAYS run pnpm typecheck && pnpm lint before declaring FIXED
+              ALWAYS prefer the minimal change — do not refactor unrelated code
+              If you cannot fix it (requires secrets, external service, manual decision),
+              report STATUS: UNFIXABLE with a clear explanation
+
+            === CI FAILURE CONTEXT (attempt {attempt} of 3) ===
+            {ctx}
+          """).strip()
+          with open("/tmp/claude-prompt.txt", "w") as f:
+              f.write(prompt)
+          print(f"Prompt written ({len(prompt)} chars)")
+          PYEOF
+        env:
+          ATTEMPT: ${{ steps.counter.outputs.attempt }}
+
+      # ── 6. Run Claude agent ─────────────────────────────────────────────────
+      - name: Run Claude agent to diagnose and fix
+        id: claude
+        run: |
+          PROMPT_TEXT=$(cat /tmp/claude-prompt.txt)
+
+          claude -p "$PROMPT_TEXT" \
+            --allowedTools "Read,Edit,Bash,Grep,Glob" \
+            --max-turns 25 \
+            2>&1 | tee /tmp/claude-output.txt
+
+          # Capture exit code
+          CLAUDE_EXIT=${PIPESTATUS[0]}
+          echo "claude_exit=$CLAUDE_EXIT" >> "$GITHUB_OUTPUT"
+
+          # Extract status from Claude output
+          if grep -q "STATUS: FIXED" /tmp/claude-output.txt; then
+            echo "status=FIXED" >> "$GITHUB_OUTPUT"
+          elif grep -q "STATUS: UNFIXABLE" /tmp/claude-output.txt; then
+            echo "status=UNFIXABLE" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=UNKNOWN" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Always succeed this step — we handle outcomes in subsequent steps
+          exit 0
+
+      # ── 7. Commit + push if Claude made changes ─────────────────────────────
+      - name: Commit and push fix
+        id: commit
+        if: steps.claude.outputs.status == 'FIXED'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage counter file regardless (always updated)
+          git add .claude/heal-counter/ || true
+
+          # Check if there are any other changes from Claude
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "No file changes detected — Claude reported FIXED but made no edits."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Stage all modified tracked files (Claude edits to src/, etc.)
+          git add -u
+
+          # Double-check that no workflow files slipped in
+          WORKFLOW_CHANGES=$(git diff --cached --name-only | grep -E '^\.github/' || true)
+          if [ -n "$WORKFLOW_CHANGES" ]; then
+            echo "::error::Claude attempted to modify workflow files: $WORKFLOW_CHANGES — aborting commit."
+            git restore --staged .
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # Build commit message (printf avoids heredoc column-0 YAML issues)
+          FILES_CHANGED=$(git diff --cached --name-only | tr '\n' ', ' | sed 's/,$//')
+          ATTEMPT="${{ steps.counter.outputs.attempt }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          FAIL_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${FAILED_RUN_ID}"
+
+          COMMIT_MSG=$(printf 'fix(ci): auto-heal CI failure [attempt %s/3]\n\nFiles: %s\nWorkflow run: %s\nFailing run: %s\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>' \
+            "$ATTEMPT" "$FILES_CHANGED" "$RUN_URL" "$FAIL_URL")
+
+          git commit -m "$COMMIT_MSG"
+
+          git push origin HEAD:"${BRANCH}"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          echo "Pushed fix to branch '${BRANCH}'"
+
+      # ── 8. Add PR comment with diagnosis ────────────────────────────────────
+      - name: Comment on PR with heal result
+        if: always() && steps.claude.outputs.status != ''
+        run: |
+          STATUS="${{ steps.claude.outputs.status }}"
+          ATTEMPT="${{ steps.counter.outputs.attempt }}"
+          COMMITTED="${{ steps.commit.outputs.committed }}"
+
+          # Find the PR number for this branch
+          PR_NUMBER=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR found for branch '$BRANCH' — skipping PR comment."
+            exit 0
+          fi
+
+          # Build a readable summary from Claude output (first 2000 chars)
+          CLAUDE_SUMMARY=$(head -c 2000 /tmp/claude-output.txt)
+          REMAINING=$((3 - ATTEMPT))
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$STATUS" = "FIXED" ] && [ "$COMMITTED" = "true" ]; then
+            ICON="🤖✅"
+            HEADLINE="Auto-heal SUCCEEDED (attempt ${ATTEMPT}/3)"
+            DETAIL="A fix has been committed and pushed to this branch. The CI pipeline will re-run automatically."
+          elif [ "$STATUS" = "UNFIXABLE" ]; then
+            ICON="🤖❌"
+            HEADLINE="Auto-heal could not fix this failure (attempt ${ATTEMPT}/3)"
+            DETAIL="Claude diagnosed the root cause but determined this requires manual intervention."
+          else
+            ICON="🤖⚠️"
+            HEADLINE="Auto-heal completed with uncertain status (attempt ${ATTEMPT}/3)"
+            DETAIL="Review the Claude output below."
+          fi
+
+          # Write the PR comment body to a file (avoids column-0 multiline string issues in YAML)
+          {
+            printf '%s **%s**\n\n' "$ICON" "$HEADLINE"
+            printf '%s\n\n' "$DETAIL"
+            printf '<details><summary>Claude diagnosis (click to expand)</summary>\n\n'
+            printf '```\n%s\n```\n\n' "$CLAUDE_SUMMARY"
+            printf '</details>\n\n---\n'
+            printf '*Auto-heal run: [%s](%s) | Attempts remaining: %s*\n' \
+              "$RUN_URL" "$RUN_URL" "$REMAINING"
+          } > /tmp/pr-comment-body.txt
+
+          gh pr comment "$PR_NUMBER" --body-file /tmp/pr-comment-body.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 9. Telegram notification ─────────────────────────────────────────────
+      - name: Notify Telegram — heal succeeded
+        if: steps.commit.outputs.committed == 'true'
+        run: |
+          ATTEMPT="${{ steps.counter.outputs.attempt }}"
+          MSG="🤖✅ *my-project Auto-Heal: Fix Pushed*%0A%0ABranch: \`${BRANCH}\`%0AAttempt: ${ATTEMPT}/3%0ACI re-run triggered.%0A%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # PLACEHOLDER: PROJECT_NAME in msg above
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+
+      - name: Notify Telegram — unfixable failure
+        if: steps.claude.outputs.status == 'UNFIXABLE'
+        run: |
+          ATTEMPT="${{ steps.counter.outputs.attempt }}"
+          REMAINING=$((3 - ATTEMPT))
+          MSG="🤖❌ *my-project Auto-Heal: Unfixable*%0A%0ABranch: \`${BRANCH}\`%0AAttempt: ${ATTEMPT}/3 (${REMAINING} remaining)%0A%0A👤 Manual fix required.%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # PLACEHOLDER: PROJECT_NAME in msg above
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+
+      - name: Summarise result in Actions UI
+        if: always()
+        run: |
+          STATUS="${{ steps.claude.outputs.status }}"
+          ATTEMPT="${{ steps.counter.outputs.attempt }}"
+          COMMITTED="${{ steps.commit.outputs.committed }}"
+
+          echo "## 🤖 AI Self-Heal Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | \`${BRANCH}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Attempt | ${ATTEMPT}/3 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Claude status | ${STATUS} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Fix committed | ${COMMITTED:-false} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Failing run | [${FAILED_RUN_ID}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${FAILED_RUN_ID}) |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" = "FIXED" ] && [ "$COMMITTED" = "true" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ Fix pushed — CI re-run triggered on branch." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$STATUS" = "UNFIXABLE" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ Claude could not auto-fix this failure. Manual intervention required." >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,0 +1,195 @@
+name: CI (Dagger)
+# פייפליין CI/CD מבוסס Dagger לפרויקטי TypeScript/Vite/Next.js.
+# Dagger מריץ את כל הלוגיקה בתוך קונטיינרים — עקבי בין local ל-CI.
+#
+# REQUIRED — הגדרות לפני העתקה לפרויקט:
+#   PROJECT_NAME: my-project     # שם הפרויקט לשליחת Telegram
+#   MAIN_BRANCH:  main           # main | master
+#
+# OPTIONAL — סודות (Secrets) שניתן להוסיף:
+#   TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID — להתראות
+#   DAGGER_CLOUD_TOKEN — לאחסון cache ב-Dagger Cloud
+#
+# הגבלות:
+#   - runs-on: [self-hosted, linux, x64, pop-os] תמיד (לא ubuntu-latest!)
+#   - cancel-in-progress: true חובה בכל workflow
+#   - deploy צריך needs: ci-gate
+#
+# שימוש מקומי (זהה ל-CI):
+#   dagger call ci
+#   dagger call build export --path=./dist-output
+
+on:
+  push:
+    branches: [main]           # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/CODEOWNERS"
+  pull_request:
+    branches: [main]           # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/CODEOWNERS"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-dagger-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  security-events: write       # לדיווח SARIF אם יתווסף בעתיד
+
+env:
+  CI: "true"
+  NODE_ENV: test
+  NODE_OPTIONS: "--max-old-space-size=4096"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DAGGER_VERSION: "0.18.7"     # Pin גרסת Dagger — עדכן בהתאם ל-Renovate
+
+jobs:
+  # ── שלב CI מלא (PR) ──────────────────────────────────────────────────────
+  ci:
+    name: CI — typecheck + lint + security + test
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Dagger
+        uses: dagger/dagger-for-github@v6
+        with:
+          version: ${{ env.DAGGER_VERSION }}
+          # cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}  # uncomment לבדיקות מואצות
+
+      - name: Run CI pipeline via Dagger
+        # dagger call ci מריץ: typecheck + lint + security (מקביל) → test
+        run: dagger call ci --source=.
+        timeout-minutes: 25
+
+      - name: Notify Telegram on failure
+        if: failure()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            CI כשל — ${{ github.repository }}
+            ענף: ${{ github.head_ref || github.ref_name }}
+            PR: ${{ github.event.pull_request.html_url || github.event.head_commit.url }}
+            שלב: ${{ github.job }}
+            הרצה: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # ── שלב Gate — תלות עבור deploy ─────────────────────────────────────────
+  ci-gate:
+    name: CI Gate
+    runs-on: [self-hosted, linux, x64, pop-os]
+    needs: [ci]
+    if: always()
+    steps:
+      - name: Check all CI jobs passed
+        run: |
+          if [[ "${{ needs.ci.result }}" != "success" && "${{ needs.ci.result }}" != "skipped" ]]; then
+            echo "CI gate failed: ci=${{ needs.ci.result }}"
+            exit 1
+          fi
+          echo "CI gate passed"
+
+  # ── שלב Build + Export (push ל-main/master בלבד) ────────────────────────
+  build:
+    name: Build — ci + pnpm build → dist
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 40
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Dagger
+        uses: dagger/dagger-for-github@v6
+        with:
+          version: ${{ env.DAGGER_VERSION }}
+          # cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+
+      - name: Run full build pipeline via Dagger
+        # dagger call build מריץ: ci() (כולל typecheck+lint+security+test) → pnpm build
+        # מחזיר את ספריית dist בלבד
+        run: dagger call build --source=. export --path=./dist-output
+        timeout-minutes: 35
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: ./dist-output/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Bundle size check
+        # בדיקה שגודל ה-bundle אינו חורג מהגבול המוגדר
+        # PLACEHOLDER: BUNDLE_LIMIT_KB — עדכן לפי הפרויקט
+        run: |
+          TOTAL_KB=$(find dist-output -name "*.js" | xargs du -k 2>/dev/null | awk '{sum+=$1} END {print sum}')
+          LIMIT_KB="${BUNDLE_LIMIT_KB:-5000}"
+          echo "Bundle: ${TOTAL_KB}KB (limit: ${LIMIT_KB}KB)"
+          if [ "${TOTAL_KB}" -gt "${LIMIT_KB}" ]; then
+            echo "Bundle size ${TOTAL_KB}KB exceeds limit ${LIMIT_KB}KB"
+            exit 1
+          fi
+        env:
+          BUNDLE_LIMIT_KB: "5000"  # PLACEHOLDER: BUNDLE_LIMIT_KB
+
+      - name: Notify Telegram on success
+        if: success()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            Build הצליח — ${{ github.repository }}
+            ענף: ${{ github.ref_name }}
+            commit: ${{ github.sha }}
+            הרצה: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Notify Telegram on failure
+        if: failure()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            Build כשל — ${{ github.repository }}
+            ענף: ${{ github.ref_name }}
+            שלב: ${{ github.job }}
+            הרצה: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # ── Deploy (needs ci-gate — חסום עד הצלחת CI) ──────────────────────────
+  # הורד את ה-# כדי להפעיל deploy:
+  # deploy:
+  #   name: Deploy
+  #   runs-on: [self-hosted, linux, x64, pop-os]
+  #   needs: [ci-gate, build]
+  #   if: github.event_name == 'push' && github.ref_name == 'main'
+  #   timeout-minutes: 15
+  #   steps:
+  #     - name: Download dist artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: dist-${{ github.sha }}
+  #         path: ./dist
+  #
+  #     - name: Deploy to Vercel
+  #       run: |
+  #         vercel deploy --prod --prebuilt ./dist \
+  #           --token=${{ secrets.VERCEL_TOKEN }} \
+  #           --scope=${{ secrets.VERCEL_ORG_ID }}
