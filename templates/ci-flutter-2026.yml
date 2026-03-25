@@ -1,0 +1,367 @@
+name: CI — Flutter 2026
+# Standalone Flutter CI template with 2026 toolchain.
+# Copy to project .github/workflows/ci.yml and customize.
+#
+# REQUIRED — fill in before copying:
+#   MAIN_BRANCH:      main          # main | master
+#   FLUTTER_VERSION:  3.41.2        # pin to exact version
+#   JAVA_VERSION:     17
+#
+# REQUIRED SECRETS:
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (Telegram CI notifications)
+#   GITHUB_TOKEN                           (auto-injected by GitHub)
+#
+# STAGES (ordered by speed):
+#   1. static-analysis  — dart pub audit + flutter analyze + DCM (<2min)
+#   2. test             — very_good test + coverde 90% gate (<5min)
+#   3. accessibility    — dedicated a11y test suite (fast, isolated)
+#   4. security         — OSV-Scanner + Trivy + gitleaks
+#   5. build            — flutter build appbundle (AAB, obfuscated)
+#   6. ci-gate          — aggregates all results + Telegram notify
+
+on:
+  push:
+    branches: [main]              # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore: ["**.md", "**.txt", "docs/**"]
+  pull_request:
+    branches: [main]              # PLACEHOLDER: MAIN_BRANCH
+    paths-ignore: ["**.md", "**.txt", "docs/**"]
+
+concurrency:
+  group: ci-flutter-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1: STATIC ANALYSIS  (target: <2min)
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  static-analysis:
+    name: Static Analysis
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.2"
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Dart pub audit (CVE check)
+        run: dart pub audit
+
+      - name: Dart format check
+        run: dart format --set-exit-if-changed .
+
+      - name: Flutter analyze (fatal-infos + fatal-warnings)
+        run: flutter analyze --fatal-infos --fatal-warnings
+
+      - name: DCM analyze
+        run: |
+          dart pub global activate dcm
+          dcm analyze lib --fatal-found
+        continue-on-error: false
+
+      - name: DCM check unused code
+        run: dcm check-unused-code lib --fatal-found
+        continue-on-error: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2: UNIT + WIDGET TESTS  (target: <5min)
+# ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: Unit + Widget Tests
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.2"
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Activate very_good_cli
+        run: dart pub global activate very_good_cli
+
+      - name: Run tests with coverage
+        # very_good test replaces `flutter test` — fail-fast + coverage enforcement
+        # Excludes generated files from coverage measurement
+        run: |
+          dart pub global run very_good_cli:very_good test \
+            --coverage \
+            --fail-fast \
+            --exclude-coverage "**/*.g.dart,**/*.freezed.dart,**/*.drift.dart"
+
+      - name: Activate coverde (coverage gate)
+        run: dart pub global activate coverde
+
+      - name: Coverage gate — enforce 90% minimum
+        run: coverde check 90
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flutter-coverage-${{ github.sha }}
+          path: coverage/lcov.info
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3: ACCESSIBILITY TESTS
+# ─────────────────────────────────────────────────────────────────────────────
+  accessibility:
+    name: Accessibility Tests
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.2"
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Activate very_good_cli
+        run: dart pub global activate very_good_cli
+
+      - name: Run accessibility tests
+        # Runs test/accessibility/ suite if it exists; soft-fail if no a11y tests yet
+        run: |
+          if [ -d "test/accessibility" ] && [ "$(ls -A test/accessibility)" ]; then
+            dart pub global run very_good_cli:very_good test \
+              --coverage \
+              test/accessibility/
+          else
+            echo "No test/accessibility/ directory found — skipping (add a11y tests to test/accessibility/)"
+            exit 0
+          fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4: SECURITY SCANNING
+# ─────────────────────────────────────────────────────────────────────────────
+  osv-scan:
+    name: OSV-Scanner (Dart/Pub CVEs)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - name: OSV-Scanner — scan pubspec.lock
+        run: |
+          curl -sL \
+            "https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64" \
+            -o /tmp/osv-scanner
+          chmod +x /tmp/osv-scanner
+          /tmp/osv-scanner --lockfile pubspec.lock
+        # Fails build on ANY known CVE in pub dependencies
+
+  trivy:
+    name: Trivy (CVE + Secrets)
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - name: Trivy — CRITICAL findings block merge
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+
+      - name: Trivy — HIGH findings (SARIF upload, warning)
+        uses: aquasecurity/trivy-action@v0.35.0
+        if: always()
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-results.sarif
+        continue-on-error: true
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+        continue-on-error: true
+
+  gitleaks:
+    name: Secret Scan (gitleaks)
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 5: BUILD
+# ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build Android AAB
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 30
+    # Build only on push to main (not on every PR) — saves CI time
+    if: github.event_name == 'push'
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.2"
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Android (release AAB, obfuscated)
+        run: |
+          flutter build appbundle \
+            --release \
+            --obfuscate \
+            --split-debug-info=build/symbols
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-symbols-${{ github.sha }}
+          path: build/symbols/
+          retention-days: 90
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aab-${{ github.sha }}
+          path: build/app/outputs/bundle/release/app-release.aab
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 6: CI GATE
+# ─────────────────────────────────────────────────────────────────────────────
+  ci-gate:
+    name: CI Gate
+    runs-on: [self-hosted, linux, x64, pop-os]
+    if: always()
+    needs:
+      - static-analysis
+      - test
+      - accessibility
+      - osv-scan
+      - trivy
+      - gitleaks
+      # build is push-only, so it's excluded from the gate needs
+    timeout-minutes: 3
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+
+      - name: Evaluate results
+        run: |
+          FAILED=0
+          [ "${{ needs.static-analysis.result }}" != "success" ] && FAILED=1 && echo "FAIL: static-analysis"
+          [ "${{ needs.test.result }}"             != "success" ] && FAILED=1 && echo "FAIL: test (unit+widget)"
+          [ "${{ needs.accessibility.result }}"    != "success" ] && FAILED=1 && echo "FAIL: accessibility"
+          [ "${{ needs.osv-scan.result }}"         != "success" ] && FAILED=1 && echo "FAIL: osv-scan (Dart CVE found)"
+          [ "${{ needs.trivy.result }}"            != "success" ] && FAILED=1 && echo "FAIL: trivy (CRITICAL CVE found)"
+          [ "${{ needs.gitleaks.result }}"         != "success" ] && FAILED=1 && echo "FAIL: gitleaks (secret leaked)"
+          [ $FAILED -eq 0 ] && echo "All Flutter 2026 CI stages passed" && exit 0
+          echo "Flutter 2026 CI FAILED — see individual job logs" && exit 1
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          MSG="${{ github.repository }} Flutter CI FAILED | ${{ github.ref_name }} | ${{ github.actor }} | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=$MSG" \
+            > /dev/null 2>&1 || true
+
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          MSG="${{ github.repository }} Flutter CI passed | ${{ github.ref_name }} | ${{ github.actor }}"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=$MSG" \
+            > /dev/null 2>&1 || true

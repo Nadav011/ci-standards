@@ -101,7 +101,7 @@ export class CiPipeline {
     @argument({ defaultPath: "." }) source: Directory
   ): Promise<Container> {
     return (await this.base(source))
-      .withExec(["pnpm", "typecheck"], { expect: "success" });
+      .withExec(["pnpm", "typecheck"]);
   }
 
   /**
@@ -116,7 +116,7 @@ export class CiPipeline {
     @argument({ defaultPath: "." }) source: Directory
   ): Promise<Container> {
     return (await this.base(source))
-      .withExec(["pnpm", "lint"], { expect: "success" });
+      .withExec(["pnpm", "lint"]);
   }
 
   /**
@@ -141,8 +141,7 @@ export class CiPipeline {
           "--coverage",
           "--maxWorkers=2",
           "--reporter=verbose",
-        ],
-        { expect: "success" }
+        ]
       );
   }
 
@@ -182,8 +181,7 @@ export class CiPipeline {
         "table",
         "--no-progress",
       ],
-      { expect: "success" }
-    );
+          );
   }
 
   /**
@@ -237,7 +235,7 @@ export class CiPipeline {
     // בניית הפרויקט לאחר הצלחת CI
     const buildContainer = (await this.base(source))
       .withEnvVariable("NODE_ENV", "production")
-      .withExec(["pnpm", "build"], { expect: "success" });
+      .withExec(["pnpm", "build"]);
 
     // החזרת ספריית dist בלבד (לא את כל הקונטיינר)
     return buildContainer.directory("/app/dist");
