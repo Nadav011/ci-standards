@@ -1,0 +1,118 @@
+# Flutter pubspec.yaml — recommended 2026 dependencies block
+# This is a REFERENCE template, not a ready-to-use pubspec.yaml.
+# Merge the relevant sections into your project's pubspec.yaml.
+#
+# Version pins reflect Q1-2026 stable releases.
+# Verify compatibility with: flutter pub outdated
+# Run after merging: flutter pub get && flutter analyze
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECOMMENDED dev_dependencies — testing + static analysis + codegen
+# ─────────────────────────────────────────────────────────────────────────────
+dev_dependencies:
+
+  # ── Static Analysis ──────────────────────────────────────────────────────
+  very_good_analysis: ^9.0.0        # Opinionated lint ruleset (basis for analysis_options)
+  custom_lint: ^0.7.5               # Plugin system for riverpod_lint + a11y lints
+  riverpod_lint: ^2.6.3             # Riverpod-specific lint rules (provider ordering, etc.)
+  flutter_a11y_lints: ^0.3.0        # Accessibility-specific lints (DirectionalWidget, etc.)
+  dart_code_metrics: ^5.7.7         # DCM — cyclomatic complexity, unused code, metrics gate
+
+  # ── Testing Core ─────────────────────────────────────────────────────────
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+
+  # ── Mocking / Test Doubles ───────────────────────────────────────────────
+  mocktail: ^1.0.4                  # Type-safe mocking (null-safe, no codegen required)
+
+  # ── Integration / Patrol ────────────────────────────────────────────────
+  patrol: ^3.15.0                   # Native interaction testing (platform channels, permissions)
+
+  # ── Golden / Screenshot Testing ──────────────────────────────────────────
+  alchemist: ^0.11.0                # Golden tests with platform-specific rendering
+
+  # ── Property-Based Testing ───────────────────────────────────────────────
+  glados: ^1.1.7                    # Hypothesis-style property testing for Dart
+
+  # ── Coverage Gate ────────────────────────────────────────────────────────
+  coverde: ^0.2.3                   # Enforce coverage threshold (coverde check 90)
+
+  # ── Accessibility Testing ────────────────────────────────────────────────
+  accessibility_tools: ^2.8.0       # AccessibilityTools widget wrapper for test assertions
+
+  # ── Memory / Leak Detection ──────────────────────────────────────────────
+  leak_tracker_flutter_testing: ^3.0.10  # Detect widget/object leaks in flutter tests
+
+  # ── Code Generation ──────────────────────────────────────────────────────
+  build_runner: ^2.4.14
+  freezed: ^3.0.6                   # NOTE: ^3.x required for Riverpod 3.x compatibility
+  riverpod_generator: ^4.0.3        # NOTE: ^4.x required for Riverpod 3.x compatibility
+  json_serializable: ^6.12.0
+
+  # ── Security Analysis (dev) ──────────────────────────────────────────────
+  dart_shield: ^0.5.1               # Static analysis for common security anti-patterns
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECOMMENDED dependencies — security + performance + runtime
+# ─────────────────────────────────────────────────────────────────────────────
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── Runtime Integrity / App Security ─────────────────────────────────────
+  freerasp: ^7.5.0                  # Anti-tampering, root/jailbreak, debugger detection
+  firebase_app_check: ^0.3.1+2      # Firebase App Check (prevents API abuse)
+  trustpin_sdk: ^4.0.0              # TLS certificate pinning (SPKI hash-based)
+  # NOTE: trustpin SPKI hash must be real SHA-256 of SubjectPublicKeyInfo field.
+  # NEVER hash full DER cert — see past-mistakes.md RULE-spki-cert-pin-hash-calculation.
+
+  # ── Secure Storage ───────────────────────────────────────────────────────
+  flutter_secure_storage: ^10.0.0   # AES-256 on Android (Keystore) / Keychain on iOS
+  confidential: any                 # Obfuscated compile-time string secrets (asset encryption)
+
+  # ── Cryptography ─────────────────────────────────────────────────────────
+  cryptography: ^2.9.0              # AES-GCM, ChaCha20-Poly1305, X25519, Ed25519
+  cryptography_flutter: ^2.9.0      # Platform-accelerated crypto (uses AES HW on iOS)
+
+  # ── Biometric Auth ───────────────────────────────────────────────────────
+  biometric_signature: any          # Biometric + cryptographic signature binding
+
+  # ── Performance ──────────────────────────────────────────────────────────
+  flutter_displaymode: ^0.7.0       # Set highest available display refresh rate (120Hz)
+  flutter_native_splash: ^2.4.7     # Native splash screen (avoids white flash)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPENDENCY CONFLICT NOTES (from past-mistakes.md)
+# ─────────────────────────────────────────────────────────────────────────────
+# When upgrading major versions, these packages move together:
+#
+#   freezed: ^3.0.6               — requires riverpod_generator ^4.x
+#   freezed_annotation: ^3.0.0   — must match freezed major
+#   riverpod_generator: ^4.0.3   — requires Riverpod ^3.x
+#   go_router_builder: ^4.0.0    — requires riverpod_generator ^4.x
+#
+# Incompatible combinations (will cause pub get to fail):
+#   ❌ freezed ^2.x + riverpod_generator ^4.x
+#   ❌ go_router_builder ^2.x + riverpod_generator ^4.x
+#   ❌ freezed_annotation ^2.x + freezed ^3.x
+#
+# After ANY pubspec.yaml constraint change:
+#   1. flutter pub get   (on the machine where flutter runs — MSI or pop-os)
+#   2. Commit pubspec.lock  (CI uses --enforce-lockfile, mismatch = CI failure)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLUTTER / DART VERSION CONSTRAINTS
+# ─────────────────────────────────────────────────────────────────────────────
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.41.2"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY — PACKAGE OVERRIDE EXAMPLES
+# Use `dependency_overrides` to force a patched version if a transitive dep
+# has a known CVE (run `dart pub audit` to discover these).
+# ─────────────────────────────────────────────────────────────────────────────
+# dependency_overrides:
+#   some_package: ^1.2.3   # CVE-YYYY-XXXXX — forces patched version
