@@ -215,7 +215,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Trivy — CRITICAL findings block merge
-        uses: aquasecurity/trivy-action@v0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 SHA-pinned
         with:
           scan-type: fs
           scan-ref: .
@@ -225,7 +225,7 @@ jobs:
           format: table
 
       - name: Trivy — HIGH findings (SARIF upload, warning)
-        uses: aquasecurity/trivy-action@v0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 SHA-pinned
         if: always()
         with:
           scan-type: fs
