@@ -1,0 +1,123 @@
+name: Dependency Health Report
+# Weekly Monday 6AM — creates a GitHub Issue summarising outdated + vulnerable deps.
+# Uses pnpm outdated + pnpm audit and opens a tracking issue with the results.
+#
+# REQUIRED — fill in before copying to project:
+#   PACKAGE_MANAGER: pnpm       # pnpm | npm
+#   MAIN_BRANCH:     main       # main | master
+#
+# NOTE for npm projects (Z/cash): replace pnpm outdated/audit with npm outdated/audit.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'        # Monday 6AM
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: dep-health-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-health:
+    name: Dependency Health Report
+    runs-on: [self-hosted, linux, x64, pop-os]
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v4
+
+      - name: Add Node.js (fnm) to PATH
+        run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
+
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm                # PLACEHOLDER: remove for npm projects
+
+      - run: pnpm install --frozen-lockfile      # PLACEHOLDER: npm ci for npm projects
+
+      - name: Run pnpm outdated
+        id: outdated
+        run: |
+          pnpm outdated --format json > /tmp/outdated.json 2>/dev/null || true
+          pnpm outdated > /tmp/outdated-table.txt 2>/dev/null || true
+          COUNT=$(python3 -c "
+          import json, sys
+          try:
+            d = json.load(open('/tmp/outdated.json'))
+            print(len(d))
+          except Exception:
+            print(0)
+          " 2>/dev/null || echo "0")
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "Outdated packages: ${COUNT}"
+        continue-on-error: true
+
+      - name: Run pnpm audit
+        id: audit
+        run: |
+          pnpm audit --audit-level=info --reporter=json > /tmp/audit.json 2>/dev/null || true
+          CRITICAL=$(python3 -c "
+          import json
+          try:
+            d = json.load(open('/tmp/audit.json'))
+            vuln = d.get('vulnerabilities', {})
+            print(sum(1 for v in vuln.values() if v.get('severity') == 'critical'))
+          except Exception:
+            print(0)
+          " 2>/dev/null || echo "0")
+          HIGH=$(python3 -c "
+          import json
+          try:
+            d = json.load(open('/tmp/audit.json'))
+            vuln = d.get('vulnerabilities', {})
+            print(sum(1 for v in vuln.values() if v.get('severity') == 'high'))
+          except Exception:
+            print(0)
+          " 2>/dev/null || echo "0")
+          echo "critical=${CRITICAL}" >> "$GITHUB_OUTPUT"
+          echo "high=${HIGH}" >> "$GITHUB_OUTPUT"
+          echo "Vulnerabilities: critical=${CRITICAL} high=${HIGH}"
+        continue-on-error: true
+
+      - name: Create GitHub Issue with results
+        run: |
+          OUTDATED="${{ steps.outdated.outputs.count }}"
+          CRITICAL="${{ steps.audit.outputs.critical }}"
+          HIGH="${{ steps.audit.outputs.high }}"
+          DATE=$(date +%Y-%m-%d)
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          OUTDATED_TABLE=$(cat /tmp/outdated-table.txt 2>/dev/null | head -40 || echo "Unable to load outdated table")
+          AUDIT_SUMMARY="Critical: ${CRITICAL} | High: ${HIGH}"
+
+          TITLE="📦 Dependency Health Report — ${DATE}"
+
+          BODY="$(printf '## Dependency Health Report\n\nDate: %s\nRepository: %s\n\n---\n\n### Outdated Packages (%s packages)\n\n```\n%s\n```\n\n### Security Vulnerabilities\n\n| Severity | Count |\n|----------|-------|\n| Critical | %s |\n| High     | %s |\n\nRun pnpm audit locally for full details, or check the [workflow run](%s) for complete output.\n\n### Recommended actions\n\n1. Review outdated packages above — update patch/minor versions first\n2. Fix any critical/high vulnerabilities with pnpm audit fix\n3. Check trivy-autofix.yml — it should auto-PR critical CVE patches on Sunday\n\n---\nAuto-created by Dependency Health workflow. Close this issue once reviewed.' \
+            "$DATE" "${{ github.repository }}" "$OUTDATED" "$OUTDATED_TABLE" "$CRITICAL" "$HIGH" "$RUN_URL")"
+          gh issue create \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "dependencies,maintenance" \
+            2>/dev/null || \
+          gh issue create \
+            --title "$TITLE" \
+            --body "$BODY" \
+            2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## Dependency Health Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outdated packages | ${{ steps.outdated.outputs.count }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Critical CVEs | ${{ steps.audit.outputs.critical }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| High CVEs | ${{ steps.audit.outputs.high }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "GitHub Issue created with full report." >> "$GITHUB_STEP_SUMMARY"

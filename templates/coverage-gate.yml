@@ -32,10 +32,12 @@ jobs:
         run: pnpm vitest run --coverage --maxWorkers=2 || true
 
       - name: Check coverage threshold
+        id: coverage-check
         run: |
           if [ -f coverage/coverage-summary.json ]; then
             LINES=$(python3 -c "import json; d=json.load(open('coverage/coverage-summary.json')); print(d['total']['lines']['pct'])")
             echo "Line coverage: ${LINES}%"
+            echo "lines=${LINES}" >> "$GITHUB_OUTPUT"
             if (( $(echo "$LINES < 50" | bc -l) )); then
               echo "::error::Coverage ${LINES}% is below 50% threshold"
               exit 1
@@ -43,4 +45,35 @@ jobs:
             echo "::notice::Coverage ${LINES}% passes threshold"
           else
             echo "::warning::No coverage report found — skipping gate"
+          fi
+
+      - name: Ratchet — auto-raise threshold if coverage improved
+        if: success() && github.event_name == 'pull_request' && steps.coverage-check.outputs.lines != ''
+        run: |
+          LINES="${{ steps.coverage-check.outputs.lines }}"
+          THRESHOLD_FILE=".coverage-threshold"
+
+          # Read current threshold (default 50 if file missing)
+          if [ -f "$THRESHOLD_FILE" ]; then
+            CURRENT=$(cat "$THRESHOLD_FILE" | tr -d '[:space:]')
+            if ! [[ "$CURRENT" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then CURRENT=50; fi
+          else
+            CURRENT=50
+          fi
+
+          echo "Current threshold: ${CURRENT}% | Actual coverage: ${LINES}%"
+
+          # If actual > current threshold by at least 1%, raise it
+          SHOULD_RAISE=$(python3 -c "print('yes' if float('${LINES}') > float('${CURRENT}') + 1 else 'no')")
+          if [ "$SHOULD_RAISE" = "yes" ]; then
+            NEW_THRESHOLD=$(python3 -c "import math; print(math.floor(float('${LINES}')))")
+            echo "${NEW_THRESHOLD}" > "$THRESHOLD_FILE"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$THRESHOLD_FILE"
+            git diff --cached --quiet || git commit -m "chore(ci): ratchet coverage threshold to ${NEW_THRESHOLD}% (was ${CURRENT}%)"
+            git push origin HEAD:"${{ github.head_ref }}" 2>/dev/null || true
+            echo "::notice::Coverage threshold raised from ${CURRENT}% to ${NEW_THRESHOLD}%"
+          else
+            echo "Threshold stays at ${CURRENT}% (coverage ${LINES}% not high enough to ratchet)"
           fi

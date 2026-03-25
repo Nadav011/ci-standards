@@ -59,10 +59,22 @@ jobs:
 
           echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
 
-      - name: Notify Telegram on failure
+      - name: Notify Telegram on health failure
         if: steps.health.outputs.failed == '1'
         run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG="🔴 *Runner Health DEGRADED*%0A%0ARepo: \`${{ github.repository }}\`%0ARunner: \`pop-os\`%0ATime: $(date -u '+%Y-%m-%d %H:%M UTC')%0A%0ACheck disk / memory / orphaned processes.%0A%0A🔗 $RUN_URL"
           curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
-            --data-urlencode "text=Runner Health DEGRADED | ${{ github.repository }}%0ACheck: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" \
+            > /dev/null 2>&1 || true
+
+      - name: Notify Telegram — runner offline (job failed to start)
+        if: failure()
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG="🚨 *Runner Offline or Unreachable*%0A%0ARepo: \`${{ github.repository }}\`%0ARunner label: \`self-hosted, linux, x64, pop-os\`%0ATime: $(date -u '+%Y-%m-%d %H:%M UTC')%0A%0AThe runner health-check job itself failed to start — runner may be offline.%0A%0A🔗 $RUN_URL"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=$MSG" -d "parse_mode=Markdown" \
             > /dev/null 2>&1 || true
