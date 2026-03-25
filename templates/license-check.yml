@@ -34,16 +34,27 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile 2>/dev/null || npm ci
 
-      - name: Check licenses
+      - name: Check licenses (gate — blocks merge on non-OSS)
+        id: license-gate
         run: |
-          npx license-checker-rseidelsohn@4.4.2 --production --failOn "GPL-3.0;AGPL-3.0;AGPL-3.0-only;GPL-3.0-only;SSPL-1.0;EUPL-1.1" --summary
-          echo "No GPL/AGPL/SSPL dependencies found"
+          echo "## License Compliance Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "Checking for GPL-3.0, AGPL-3.0, SSPL-1.0, EUPL-1.1..." >> "$GITHUB_STEP_SUMMARY"
+
+          # This exits 1 if any banned license is found — merge blocked
+          npx license-checker-rseidelsohn@4.4.2 \
+            --production \
+            --failOn "GPL-3.0;AGPL-3.0;AGPL-3.0-only;GPL-3.0-only;GPL-2.0;GPL-2.0-only;SSPL-1.0;EUPL-1.1;LGPL-3.0;LGPL-3.0-only" \
+            --summary
+          echo "::notice::No restricted licenses found — merge allowed"
 
       - name: License summary
         if: always()
         run: |
-          echo "## License Summary" >> "$GITHUB_STEP_SUMMARY"
-          npx license-checker-rseidelsohn@4.4.2 --production --summary --csv | head -20 >> "$GITHUB_STEP_SUMMARY" || true
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Full License Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          npx license-checker-rseidelsohn@4.4.2 --production --summary 2>/dev/null | head -30 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Telegram on failure
         if: failure()

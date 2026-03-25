@@ -90,7 +90,17 @@ jobs:
       #   run: npx wait-on@8 http://localhost:3000 --timeout 30000
 
       - name: Run Lighthouse CI
-        run: npx @lhci/cli@0.15.1 autorun --collect.url=http://localhost:4173
+        run: |
+          npx @lhci/cli@0.15.1 autorun \
+            --collect.url=http://localhost:4173 \
+            --assert.assertions.'categories:performance'=error \
+            --assert.assertions.'categories:performance'.minScore=0.7 \
+            --assert.assertions.'categories:accessibility'=error \
+            --assert.assertions.'categories:accessibility'.minScore=0.9 \
+            --assert.assertions.'categories:best-practices'=warn \
+            --assert.assertions.'categories:best-practices'.minScore=0.8 \
+            --assert.assertions.'categories:seo'=warn \
+            --assert.assertions.'categories:seo'.minScore=0.8
         # PLACEHOLDER: for nextjs replace port with 3000
         env:
           LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}

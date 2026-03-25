@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: a11y-${{ github.ref }}
@@ -53,6 +54,7 @@ jobs:
           (npx serve@14 build -l 3000 &>/dev/null & npx wait-on@8 http://localhost:3000 --timeout 30000) || true
 
       - name: Run axe-core accessibility scan
+        id: axe-scan
         run: |
           npx @axe-core/cli@4.11.1 http://localhost:3000 --exit --tags wcag2a,wcag2aa,wcag21a,wcag21aa --reporter json > axe-results.json 2>&1 || true
           # Parse results
@@ -66,11 +68,31 @@ jobs:
             echo "| Passes | $PASSES |" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Violations: $VIOLATIONS | Passes: $PASSES"
+            echo "violations=$VIOLATIONS" >> "$GITHUB_OUTPUT"
             if [ "$VIOLATIONS" != "0" ] && [ "$VIOLATIONS" != "?" ]; then
               echo "::error::$VIOLATIONS accessibility violations found"
               exit 1
             fi
           fi
+
+      - name: Create GitHub Issue on accessibility failure
+        if: failure() && steps.axe-scan.outputs.violations != '' && steps.axe-scan.outputs.violations != '0'
+        run: |
+          VIOLATIONS="${{ steps.axe-scan.outputs.violations }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BODY="$(printf '## Accessibility Violations Detected\n\n**%s WCAG violations** found on \`%s\` by axe-core.\n\n**Branch:** \`%s\`  \n**Commit:** \`%s\`  \n**Run:** [View full report](%s)\n\n### What to check\n- Screen reader labels (`aria-label`, `aria-labelledby`)\n- Color contrast ratios (WCAG AA: 4.5:1 text, 3:1 UI)\n- Keyboard navigation and focus indicators\n- Alternative text for images\n- Form field associations\n\n### Next steps\n1. Download the `accessibility-report` artifact from the failed run\n2. Fix each violation in `axe-results.json`\n3. Re-run the workflow to verify\n\n*Auto-created by Accessibility CI workflow.*' "$VIOLATIONS" "${{ github.ref_name }}" "${{ github.ref_name }}" "${{ github.sha }}" "$RUN_URL")"
+          gh issue create \
+            --title "♿ Accessibility violations: ${VIOLATIONS} WCAG issues on \`${{ github.ref_name }}\`" \
+            --body "$BODY" \
+            --label "a11y,bug" \
+            2>/dev/null || \
+          gh issue create \
+            --title "♿ Accessibility violations: ${VIOLATIONS} WCAG issues on \`${{ github.ref_name }}\`" \
+            --body "$BODY" \
+            --label "bug" \
+            2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload accessibility report
         if: always()

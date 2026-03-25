@@ -98,11 +98,16 @@ jobs:
     needs: install
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
       - uses: step-security/harden-runner@v2.16.0
         with:
           egress-policy: audit
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Add Node.js (fnm) to PATH
         run: echo "$HOME/.local/share/fnm/node-versions/v24.14.0/installation/bin" >> $GITHUB_PATH
       - name: Enable pnpm via corepack
@@ -113,7 +118,23 @@ jobs:
           key: nm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
       - name: Install if cache miss
         run: '[ -d node_modules ] || pnpm install --frozen-lockfile'
-      - run: pnpm run lint                       # PLACEHOLDER: LINT_CMD
+      - name: Lint
+        id: lint
+        run: pnpm run lint                       # PLACEHOLDER: LINT_CMD
+        continue-on-error: true
+      - name: Biome auto-fix on push to main
+        if: steps.lint.outcome == 'failure' && github.event_name == 'push'
+        run: pnpm biome check --write . 2>&1 || true
+      - name: Auto-commit Biome fixes
+        if: steps.lint.outcome == 'failure' && github.event_name == 'push'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "style: biome auto-fix"
+          file_pattern: "src/**/*.ts src/**/*.tsx app/**/*.ts app/**/*.tsx"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+      - name: Lint gate (final)
+        run: pnpm run lint                       # PLACEHOLDER: LINT_CMD
 
   # ── Security (independent) ────────────────────────────────────────────────────
   trivy:
@@ -129,7 +150,7 @@ jobs:
           egress-policy: audit
       - uses: actions/checkout@v4
       - name: Trivy — CRITICAL findings block merge
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.35.0
         with:
           scan-type: fs
           scan-ref: .
@@ -138,7 +159,7 @@ jobs:
           ignore-unfixed: true
           format: table
       - name: Trivy — HIGH findings (warning)
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.35.0
         if: always()
         with:
           scan-type: fs

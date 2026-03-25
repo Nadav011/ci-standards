@@ -99,16 +99,36 @@ jobs:
     needs: install
     runs-on: [self-hosted, linux, x64, pop-os]
     timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
       - uses: step-security/harden-runner@v2.16.0
         with:
           egress-policy: audit
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup Biome
         uses: biomejs/setup-biome@v2
         with:
           version: "2.4.4"
       - name: Biome CI (lint + format check)
+        id: biome-ci
+        run: biome ci .
+        continue-on-error: true
+      - name: Biome auto-fix on push to main
+        if: failure() && github.event_name == 'push'
+        run: biome check --write . 2>&1 || true
+      - name: Auto-commit Biome fixes
+        if: failure() && github.event_name == 'push'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "style: biome auto-fix"
+          file_pattern: "src/**/*.ts src/**/*.tsx src/**/*.js src/**/*.jsx"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+      - name: Biome CI gate (final)
         run: biome ci .
 
   # ── Security (independent — no need to wait for install) ────────────────────
@@ -125,7 +145,7 @@ jobs:
           egress-policy: audit
       - uses: actions/checkout@v4
       - name: Trivy — CRITICAL findings block merge
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.35.0
         with:
           scan-type: fs
           scan-ref: .
@@ -134,7 +154,7 @@ jobs:
           ignore-unfixed: true
           format: table
       - name: Trivy — HIGH findings (warning)
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.35.0
         if: always()
         with:
           scan-type: fs

@@ -47,14 +47,18 @@ jobs:
           echo "$OUTPUT"
 
           if echo "$OUTPUT" | grep -q "Found [1-9]"; then
-            CYCLES=$(echo "$OUTPUT" | grep "Found " | grep -o "[0-9]*")
+            CYCLES=$(echo "$OUTPUT" | grep "Found " | grep -o "[0-9]*" | head -1)
             echo "## Circular Dependencies Found" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning::$CYCLES circular dependencies detected"
+            echo "cycles=${CYCLES}" >> "$GITHUB_OUTPUT"
+            echo "has_cycles=true" >> "$GITHUB_OUTPUT"
+            echo "::error::$CYCLES circular dependencies detected — merge blocked"
+            exit 1
           else
+            echo "has_cycles=false" >> "$GITHUB_OUTPUT"
             echo "## No Circular Dependencies" >> "$GITHUB_STEP_SUMMARY"
             echo "Clean import graph." >> "$GITHUB_STEP_SUMMARY"
           fi

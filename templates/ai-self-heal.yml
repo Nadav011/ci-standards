@@ -38,7 +38,7 @@ name: AI Self-Heal CI
 
 on:
   workflow_run:
-    workflows: ["CI"]              # PLACEHOLDER: WATCHED_WORKFLOW
+    workflows: ["CI", "CI Pipeline", "Lighthouse CI", "Accessibility", "Security Scan", "Code Quality Gates"]
     types: [completed]
   workflow_dispatch:
     inputs:
