@@ -1,0 +1,18 @@
+feat:
+  - head-branch: ['^feat/', '^feature/']
+fix:
+  - head-branch: ['^fix/', '^bugfix/', '^hotfix/']
+docs:
+  - changed-files:
+    - any-glob-to-any-file: ['**/*.md', 'docs/**']
+deps:
+  - head-branch: ['^renovate/', '^dependabot/']
+ci:
+  - changed-files:
+    - any-glob-to-any-file: ['.github/**']
+style:
+  - changed-files:
+    - any-glob-to-any-file: ['**/*.css', '**/*.scss']
+test:
+  - changed-files:
+    - any-glob-to-any-file: ['**/*.test.*', '**/*.spec.*', '**/__tests__/**']

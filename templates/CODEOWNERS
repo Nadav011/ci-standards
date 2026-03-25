@@ -1,0 +1,10 @@
+# Default owner for all files
+* @Nadav011
+
+# CI/CD workflows require explicit review
+.github/ @Nadav011
+
+# Security-sensitive files
+**/auth/** @Nadav011
+**/security/** @Nadav011
+supabase/ @Nadav011
